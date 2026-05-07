@@ -27,7 +27,10 @@
       <li>Live preview — changes apply instantly, no reload needed</li>
       <li>Monitor configuration with layout preview; VRR, HDR, and 10-bit detection</li>
       <li>Bezier curve editor with draggable control points and live animation preview</li>
-      <li>Keybind editor with interactive key capture</li>
+      <li>Keybind editor with interactive key capture, including mouse-drag binds</li>
+      <li>Window rules and layer rules editors with live preview</li>
+      <li>Autostart and environment variable management</li>
+      <li>Pending Changes page — review every unsaved edit before saving</li>
       <li>Cursor theme picker with live previews</li>
       <li>Profiles — save, name, and switch between complete configurations</li>
       <li>Config DNA — every profile gets a unique visual fingerprint</li>
@@ -67,6 +70,22 @@
   </keywords>
 
   <releases>
+    <release version="0.2.0" date="2026-05-07">
+      <description>
+        <p>New configuration pages and UX improvements:</p>
+        <ul>
+          <li>Window Rules page — manage windowrule entries with a window picker and live preview</li>
+          <li>Layer Rules page — manage layerrule entries with curated presets and live preview</li>
+          <li>Autostart page — manage exec and exec-once entries with an app picker</li>
+          <li>Env Variables page — manage env entries with POSIX name validation</li>
+          <li>Pending Changes page — review every unsaved edit across the app in one place</li>
+          <li>Mouse-drag (bindm) keybinds with dispatcher, category, and preset support</li>
+          <li>Sidebar reorganized by task; Dwindle, Master, and Scrolling merged into a single Layouts page</li>
+          <li>Profiles page redesigned — active profile promoted to a hero card with the saved-profiles list below; cards show last-modified date</li>
+          <li>Saving keeps the active profile in sync automatically</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-04-21">
       <description>
         <p>Initial release.</p>

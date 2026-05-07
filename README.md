@@ -40,7 +40,10 @@ Huge thanks to the creators below — without you, HyprMod would reach far fewer
 
 - Bezier curve editor with live animation preview
 - Monitor layout editor with VRR, HDR, and 10-bit detection
-- Keybind editor with interactive key capture
+- Keybind editor with interactive key capture, including mouse-drag (`bindm`) binds
+- Window rules and layer rules editors with live preview
+- Autostart (`exec` / `exec-once`) and environment variable management
+- Pending Changes page — review every unsaved edit before saving
 - Cursor theme picker with live preview
 - Config DNA — a unique visual fingerprint per profile
 - Global search across all options (Ctrl+F)
@@ -86,8 +89,6 @@ On first launch, HyprMod asks permission to add one `source` line to your `hyprl
 ## 🗺️ Roadmap
 
 **Next**
-- Window rules, layer rules, and `windowrulev2` editor
-- `exec-once` (autostart) and environment variable pages
 - Automatic backups on save, with a history browser
 - Translations (gettext)
 

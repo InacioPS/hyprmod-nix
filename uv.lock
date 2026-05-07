@@ -52,7 +52,7 @@ wheels = [
 
 [[package]]
 name = "hyprland-state"
-version = "0.2.0"
+version = "0.2.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "hyprland-config" },
@@ -60,14 +60,14 @@ dependencies = [
     { name = "hyprland-schema" },
     { name = "hyprland-socket" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b1/49/34ecbc053ef991a27dc279ca4cdac707cfe3dce4b80842fb8f0e5c919aca/hyprland_state-0.2.0.tar.gz", hash = "sha256:2442a8099f1e70226f88a8beff79f7d564368873389a756b1abf12e18358d954", size = 13283, upload-time = "2026-03-26T19:35:18.56Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/1f/6f/ab7cb80e594d3c3b9328d2b3102405e538773b73d89266c96dc2fbf24e1d/hyprland_state-0.2.1.tar.gz", hash = "sha256:608ec0b8c7ac1e5193968d7537bf465be507ab80fbe476fc88d109cb681c748d", size = 13696, upload-time = "2026-05-05T08:09:29.654Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/76/d0/07f049263b6d776e6c3ee89b294763d7468cce48661c59be5e0a6463bbc5/hyprland_state-0.2.0-py3-none-any.whl", hash = "sha256:c21b574bafe498e5823420247605e3a10d401408d5df6c881acd7d93775e5195", size = 16395, upload-time = "2026-03-26T19:35:17.389Z" },
+    { url = "https://files.pythonhosted.org/packages/74/2b/cab1e730f3d944548ec7d5216574908c9ef25e631af9e938a778dfecc93a/hyprland_state-0.2.1-py3-none-any.whl", hash = "sha256:d475934431cdc8f8ada86aea013c77054d59bb3526c74dc01f7fbb09be4d4520", size = 16839, upload-time = "2026-05-05T08:09:28.166Z" },
 ]
 
 [[package]]
 name = "hyprmod"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "hyprland-config" },
@@ -92,7 +92,7 @@ requires-dist = [
     { name = "hyprland-monitors", specifier = ">=0.4.0" },
     { name = "hyprland-schema", specifier = ">=0.4.0" },
     { name = "hyprland-socket", specifier = ">=0.9.1" },
-    { name = "hyprland-state", specifier = ">=0.2.0" },
+    { name = "hyprland-state", specifier = ">=0.2.1" },
     { name = "pygobject", specifier = ">=3.56.2" },
 ]
 
