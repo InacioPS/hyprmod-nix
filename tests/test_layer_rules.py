@@ -29,7 +29,6 @@ from hyprmod.core.change_tracking import (
 )
 from hyprmod.core.layer_rules import (
     CUSTOM_PRESET,
-    KEYWORD_WRITE,
     LAYER_ACTION_PRESETS_BY_ID,
     LAYER_BOOL_EFFECTS,
     LAYER_RULE_KEYWORDS,
@@ -275,8 +274,12 @@ class TestKeywords:
     def test_layer_rule_keywords_contains_layerrule(self):
         assert config.KEYWORD_LAYERRULE in LAYER_RULE_KEYWORDS
 
-    def test_keyword_write_is_layerrule(self):
-        assert KEYWORD_WRITE == "layerrule"
+    def test_serialized_lines_use_layerrule(self):
+        # Hyprland 0.54+: write keyword is ``layerrule``. Round-tripping a
+        # plain rule should emit the canonical form.
+        rule = LayerRule(namespace="waybar", rule_name="blur")
+        assert rule.to_line().startswith(f"{config.KEYWORD_LAYERRULE} = ")
+        assert config.KEYWORD_LAYERRULE == "layerrule"
 
 
 class TestBoolEffectCatalog:

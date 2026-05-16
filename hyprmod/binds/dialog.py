@@ -567,20 +567,25 @@ class BindEditDialog(Adw.Dialog):
 
     def _register_capture_submap(self):
         # The sentinel bind exists only so Hyprland will accept the submap
-        # (it refuses to enter a submap with no binds — "submap doesn't
-        # exist"). XF86LaunchA is a multimedia keysym that's absent from
-        # virtually every keyboard, so it never matches and never fires.
+        # (it refuses to register one with no binds). XF86LaunchA is a
+        # multimedia keysym that's absent from virtually every keyboard,
+        # so it never matches and never fires.
         #
-        # We deliberately don't use ``bind = , catchall, pass,``: that
-        # catches modifier-only key events (e.g. ``Hyper_L`` from
-        # ``caps:hyper``) and consumes them, so the focused client never
-        # sees them. With only the sentinel, unmatched keys — including
-        # modifier presses — pass through to the focused client by
-        # default, which is exactly what the keysym tracker needs.
+        # ``noop`` (not ``pass``) is the dispatcher so the bind translates
+        # cleanly to Lua's ``hl.dsp.no_op()`` — functionally identical for
+        # a sentinel that never fires.
+        #
+        # We deliberately don't use ``bind = , catchall, …``: that catches
+        # modifier-only key events (e.g. ``Hyper_L`` from ``caps:hyper``)
+        # and consumes them, so the focused client never sees them. With
+        # only the sentinel, unmatched keys — including modifier presses —
+        # pass through to the focused client by default, which is exactly
+        # what the keysym tracker needs.
         try:
-            self._window.hypr.keyword("submap", "hyprmod_capture")
-            self._window.hypr.keyword("bind", ", XF86LaunchA, pass,")
-            self._window.hypr.keyword("submap", "reset")
+            self._window.hypr.define_submap(
+                "hyprmod_capture",
+                binds=[("bind", ", XF86LaunchA, noop,")],
+            )
         except HyprlandError as e:
             self._window.show_toast(f"Capture setup failed — {e}", timeout=5)
 

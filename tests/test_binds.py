@@ -1,6 +1,6 @@
 """Tests for keybind override tracking and dispatcher presentation data."""
 
-from hyprland_config import BindData
+from hyprland_config import BindData, Document, parse_string
 from hyprland_socket import MOD_BITS, Bind
 
 from hyprmod.binds import (
@@ -17,10 +17,11 @@ from hyprmod.binds import (
     categorize_bind,
     categorize_dispatcher,
     dispatcher_label,
+    enrich_lua_binds,
     format_action,
     format_bind_action,
+    live_bind_to_data,
 )
-from hyprmod.pages.binds import _live_bind_to_data
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -89,6 +90,27 @@ class TestGetBindLines:
         assert len(unbind_lines) == 1
         assert "SUPER, Q" in unbind_lines[0]
 
+    def test_unbind_precedes_its_matching_bind(self):
+        # Adjacency matters: parse_saved_overrides pairs each unbind with
+        # the *next* bind it sees, so any unrelated bind in between would
+        # silently misattribute the override. The non-overridden bind that
+        # comes first in owned must not appear between unbind and the
+        # actual override.
+        hypr = [_mkbind(["CTRL", "ALT"], "R", "exec", "meru-original")]
+        tracker = OverrideTracker(hypr)
+        owned = [
+            _mkbind(["MOD3"], "G", "exec", "ghostty"),
+            _mkbind(["CTRL", "ALT"], "R", "exec", "meru"),
+        ]
+        lines = tracker.get_bind_lines(owned)
+        # The unbind sits immediately before its replacement bind.
+        unbind_idx = next(i for i, ln in enumerate(lines) if ln.startswith("unbind"))
+        meru_idx = next(i for i, ln in enumerate(lines) if "meru" in ln and ln.startswith("bind"))
+        assert unbind_idx + 1 == meru_idx
+        # And the unrelated bind isn't sandwiched between them.
+        ghostty_idx = next(i for i, ln in enumerate(lines) if "ghostty" in ln)
+        assert ghostty_idx < unbind_idx
+
 
 # ---------------------------------------------------------------------------
 # OverrideTracker — config parsing
@@ -99,55 +121,44 @@ class TestOverrideParsing:
     """Test that unbind+bind pairs in config are correctly parsed as overrides."""
 
     @staticmethod
-    def _parse(config_text, owned_binds, all_hypr_binds):
+    def _parse(tmp_path, config_text, owned_binds, all_hypr_binds):
         """Helper: replicate config parsing logic via OverrideTracker."""
-        import os
-        import tempfile
-        from pathlib import Path
+        path = tmp_path / "hyprland-gui.conf"
+        path.write_text(config_text)
+        tracker = OverrideTracker(all_hypr_binds, managed_path=path)
+        tracker.parse_saved_overrides(owned_binds)
+        return tracker
 
-        from hyprmod.core.config import set_gui_conf
-
-        # Write config to a temp file and temporarily set gui_conf
-        fd, path = tempfile.mkstemp(suffix=".conf")
-        try:
-            os.write(fd, config_text.encode())
-            os.close(fd)
-            set_gui_conf(Path(path))
-            tracker = OverrideTracker(all_hypr_binds)
-            tracker.parse_saved_overrides(owned_binds)
-            return tracker
-        finally:
-            set_gui_conf(None)
-            os.unlink(path)
-
-    def test_same_combo_override(self):
+    def test_same_combo_override(self, tmp_path):
         config_text = "unbind = SUPER, Q\nbind = SUPER, Q, exec, my-close-script\n"
         hypr = [_mkbind(["SUPER"], "Q", "killactive")]
         owned = [_mkbind(["SUPER"], "Q", "exec", "my-close-script")]
-        tracker = self._parse(config_text, owned, hypr)
+        tracker = self._parse(tmp_path, config_text, owned, hypr)
         assert tracker.has_original(0)
 
-    def test_changed_combo_override(self):
+    def test_changed_combo_override(self, tmp_path):
         config_text = "unbind = SUPER, Q\nbind = SUPER SHIFT, Q, killactive,\n"
         hypr = [_mkbind(["SUPER"], "Q", "killactive")]
         owned = [_mkbind(["SUPER", "SHIFT"], "Q", "killactive")]
-        tracker = self._parse(config_text, owned, hypr)
+        tracker = self._parse(tmp_path, config_text, owned, hypr)
         assert tracker.has_original(0)
 
-    def test_regular_bind_not_override(self):
+    def test_regular_bind_not_override(self, tmp_path):
         config_text = "bind = SUPER, T, exec, kitty\n"
         hypr = [_mkbind(["SUPER"], "Q", "killactive")]
         owned = [_mkbind(["SUPER"], "T", "exec", "kitty")]
-        tracker = self._parse(config_text, owned, hypr)
+        tracker = self._parse(tmp_path, config_text, owned, hypr)
         assert not tracker.has_original(0)
 
-    def test_unbind_without_matching_hypr(self):
+    def test_unbind_without_matching_hypr(self, tmp_path):
         """When neither live binds nor config document have the original, no override is tracked."""
         config_text = "unbind = SUPER, Z\nbind = SUPER, Z, exec, something\n"
-        tracker = self._parse(config_text, [_mkbind(["SUPER"], "Z", "exec", "something")], [])
+        tracker = self._parse(
+            tmp_path, config_text, [_mkbind(["SUPER"], "Z", "exec", "something")], []
+        )
         assert not tracker.has_original(0)
 
-    def test_multiple_binds_mixed(self):
+    def test_multiple_binds_mixed(self, tmp_path):
         config_text = (
             "unbind = SUPER, Q\nbind = SUPER SHIFT, Q, killactive,\n"
             "bind = SUPER, T, exec, kitty\n"
@@ -162,26 +173,53 @@ class TestOverrideParsing:
             _mkbind(["SUPER"], "T", "exec", "kitty"),
             _mkbind(["SUPER"], "V", "togglefloating"),
         ]
-        tracker = self._parse(config_text, owned, hypr)
+        tracker = self._parse(tmp_path, config_text, owned, hypr)
         assert tracker.has_original(0)
         assert not tracker.has_original(1)
         assert tracker.has_original(2)
 
-    def test_comment_between_unbind_and_bind(self):
+    def test_comment_between_unbind_and_bind(self, tmp_path):
         config_text = "unbind = SUPER, Q\n# comment\nbind = SUPER SHIFT, Q, killactive,\n"
         hypr = [_mkbind(["SUPER"], "Q", "killactive")]
         owned = [_mkbind(["SUPER", "SHIFT"], "Q", "killactive")]
-        tracker = self._parse(config_text, owned, hypr)
+        tracker = self._parse(tmp_path, config_text, owned, hypr)
         assert tracker.has_original(0)
 
-    def test_option_between_unbind_and_bind_breaks_pairing(self):
+    def test_option_between_unbind_and_bind_still_pairs(self, tmp_path):
+        # Unrelated assignments between an unbind and the next bind don't
+        # break the override pairing — the user clearly intended the
+        # unbind+bind as a changed-combo override regardless of what's
+        # interleaved between. The parser prefers same-combo matches first
+        # and falls back to next-following-bind, which is robust against
+        # config noise between the two lines.
         config_text = (
             "unbind = SUPER, Q\ngeneral:gaps_out = 5\nbind = SUPER SHIFT, Q, killactive,\n"
         )
         hypr = [_mkbind(["SUPER"], "Q", "killactive")]
         owned = [_mkbind(["SUPER", "SHIFT"], "Q", "killactive")]
-        tracker = self._parse(config_text, owned, hypr)
+        tracker = self._parse(tmp_path, config_text, owned, hypr)
+        assert tracker.has_original(0)
+
+    def test_unbind_pairs_with_same_combo_bind_not_intervening_bind(self, tmp_path):
+        # Reproduces the older layout's pairing trap: when an unbind sits
+        # ahead of an unrelated bind followed by the actual replacement,
+        # the parser must pair the unbind with the *same-combo* bind, not
+        # with the first bind it encounters.
+        config_text = (
+            "unbind = CTRL ALT, R\n"
+            "bind = ALT MOD3, G, exec, ghostty\n"
+            "bind = CTRL ALT, R, exec, meru\n"
+        )
+        hypr = [_mkbind(["CTRL", "ALT"], "R", "exec", "meru-original")]
+        owned = [
+            _mkbind(["ALT", "MOD3"], "G", "exec", "ghostty"),
+            _mkbind(["CTRL", "ALT"], "R", "exec", "meru"),
+        ]
+        tracker = self._parse(tmp_path, config_text, owned, hypr)
+        # The G bind isn't an override of anything.
         assert not tracker.has_original(0)
+        # The R bind correctly takes the unbind as its override marker.
+        assert tracker.has_original(1)
 
 
 # ---------------------------------------------------------------------------
@@ -217,30 +255,17 @@ class TestRefilterHyprBinds:
         tracker = OverrideTracker([hypr_q])
         assert len(tracker.filter_hypr_binds([])) == 1
 
-    def test_saved_override_filtered(self):
+    def test_saved_override_filtered(self, tmp_path):
         """Original combo filtered via saved unbind originals after mark_saved."""
+        # Simulate save: write the managed config first, then drive the
+        # tracker against that path.
+        path = tmp_path / "hyprland-gui.conf"
+        path.write_text("unbind = SUPER, Q\nbind = SUPER SHIFT, Q, killactive,\n")
         hypr_q = _mkbind(["SUPER"], "Q", "killactive")
-        tracker = OverrideTracker([hypr_q])
+        tracker = OverrideTracker([hypr_q], managed_path=path)
         tracker.add_override(0, hypr_q)
         owned = [_mkbind(["SUPER", "SHIFT"], "Q", "killactive")]
-
-        # Simulate save: clear session, re-parse
-        import os
-        import tempfile
-        from pathlib import Path
-
-        from hyprmod.core.config import set_gui_conf
-
-        config_text = "unbind = SUPER, Q\nbind = SUPER SHIFT, Q, killactive,\n"
-        fd, path = tempfile.mkstemp(suffix=".conf")
-        try:
-            os.write(fd, config_text.encode())
-            os.close(fd)
-            set_gui_conf(Path(path))
-            tracker.mark_saved(owned)
-        finally:
-            set_gui_conf(None)
-            os.unlink(path)
+        tracker.mark_saved(owned)
 
         filtered = tracker.filter_hypr_binds(owned)
         assert len(filtered) == 0
@@ -347,29 +372,16 @@ class TestOverrideFlow:
         assert len(filtered) == 1
         assert filtered[0].combo == (("SUPER",), "Q")
 
-    def test_override_save_then_delete(self):
-        import os
-        import tempfile
-        from pathlib import Path
-
+    def test_override_save_then_delete(self, tmp_path):
+        # Save first so the managed-config path exists at construction time;
+        # then drive the tracker against it.
+        path = tmp_path / "hyprland-gui.conf"
+        path.write_text("unbind = SUPER, Q\nbind = SUPER SHIFT, Q, killactive,\n")
         hypr_q = _mkbind(["SUPER"], "Q", "killactive")
-        tracker = OverrideTracker([hypr_q])
+        tracker = OverrideTracker([hypr_q], managed_path=path)
         owned = [_mkbind(["SUPER", "SHIFT"], "Q", "killactive")]
         tracker.add_override(0, hypr_q)
-
-        # Save
-        from hyprmod.core.config import set_gui_conf
-
-        config_text = "unbind = SUPER, Q\nbind = SUPER SHIFT, Q, killactive,\n"
-        fd, path = tempfile.mkstemp(suffix=".conf")
-        try:
-            os.write(fd, config_text.encode())
-            os.close(fd)
-            set_gui_conf(Path(path))
-            tracker.mark_saved(owned)
-        finally:
-            set_gui_conf(None)
-            os.unlink(path)
+        tracker.mark_saved(owned)
 
         assert tracker.has_original(0)
         assert len(tracker.filter_hypr_binds(owned)) == 0
@@ -479,7 +491,7 @@ SUPER_MASK = MOD_BITS["SUPER"]
 class TestLiveBindToData:
     def test_plain_bind_passes_through(self):
         bind = Bind(modmask=SUPER_MASK, key="Q", dispatcher="killactive", arg="")
-        bd = _live_bind_to_data(bind)
+        bd = live_bind_to_data(bind)
         assert bd.bind_type == "bind"
         assert bd.mods == ["SUPER"]
         assert bd.key == "Q"
@@ -495,7 +507,7 @@ class TestLiveBindToData:
             arg="movewindow",
             mouse=True,
         )
-        bd = _live_bind_to_data(bind)
+        bd = live_bind_to_data(bind)
         assert bd.bind_type == "bindm"
         assert bd.dispatcher == "movewindow"
         assert bd.arg == ""
@@ -509,28 +521,70 @@ class TestLiveBindToData:
             arg="resizewindow",
             mouse=True,
         )
-        bd = _live_bind_to_data(bind)
+        bd = live_bind_to_data(bind)
         assert bd.to_line() == "bindm = SUPER, mouse:273, resizewindow"
 
     def test_binde_flag(self):
         bind = Bind(modmask=SUPER_MASK, key="L", dispatcher="resizeactive", arg="10 0", repeat=True)
-        assert _live_bind_to_data(bind).bind_type == "binde"
+        assert live_bind_to_data(bind).bind_type == "binde"
 
     def test_bindl_flag(self):
         bind = Bind(modmask=0, key="XF86AudioPlay", dispatcher="exec", arg="playerctl", locked=True)
-        assert _live_bind_to_data(bind).bind_type == "bindl"
+        assert live_bind_to_data(bind).bind_type == "bindl"
 
     def test_bindr_flag(self):
         bind = Bind(modmask=SUPER_MASK, key="A", dispatcher="exec", arg="x", release=True)
-        assert _live_bind_to_data(bind).bind_type == "bindr"
+        assert live_bind_to_data(bind).bind_type == "bindr"
 
     def test_bindn_flag(self):
         bind = Bind(modmask=0, key="A", dispatcher="exec", arg="x", non_consuming=True)
-        assert _live_bind_to_data(bind).bind_type == "bindn"
+        assert live_bind_to_data(bind).bind_type == "bindn"
 
     def test_no_modmask_yields_empty_mods(self):
         bind = Bind(modmask=0, key="Print", dispatcher="exec", arg="screenshot")
-        assert _live_bind_to_data(bind).mods == []
+        assert live_bind_to_data(bind).mods == []
+
+
+class TestEnrichLuaBinds:
+    """In Lua mode Hyprland reports ``dispatcher='__lua'`` for every bind —
+    the runtime stores them as closures. Real dispatcher info has to come
+    from the parsed source via the Lua reader's Document output.
+    """
+
+    def test_passes_through_when_no_lua_dispatcher(self):
+        live = [_mkbind(["SUPER"], "Q", "killactive")]
+        out = enrich_lua_binds(live, Document())
+        assert out is live  # short-circuit: no work to do
+
+    def test_replaces_lua_dispatcher_with_parsed_one(self):
+        doc = parse_string("bind = SUPER, Q, killactive,\nbind = SUPER, return, exec, kitty\n")
+        live = [
+            _mkbind(["SUPER"], "Q", "__lua", arg="5"),
+            _mkbind(["SUPER"], "return", "__lua", arg="6"),
+        ]
+        out = enrich_lua_binds(live, doc)
+        assert [(b.dispatcher, b.arg) for b in out] == [
+            ("killactive", ""),
+            ("exec", "kitty"),
+        ]
+
+    def test_preserves_bind_type_from_live(self):
+        # Document spells it ``bindm = …`` (mouse drag); live bind has the
+        # right ``bind_type`` already. Enrichment must keep the live type
+        # (authoritative for which variant is registered) but adopt the
+        # document's dispatcher.
+        doc = parse_string("bindm = SUPER, mouse:272, movewindow\n")
+        live = [_mkbind(["SUPER"], "mouse:272", "__lua", arg="3", bind_type="bindm")]
+        out = enrich_lua_binds(live, doc)
+        assert out[0].bind_type == "bindm"
+        assert out[0].dispatcher == "movewindow"
+
+    def test_unmatched_combo_falls_through(self):
+        # No matching bind in the document — keep the live bind so the
+        # user at least sees that the bind exists.
+        live = [_mkbind(["SUPER"], "X", "__lua", arg="99")]
+        out = enrich_lua_binds(live, Document())
+        assert out == live
 
 
 # ---------------------------------------------------------------------------

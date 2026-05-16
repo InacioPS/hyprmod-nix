@@ -28,8 +28,9 @@ from collections.abc import Callable
 
 from gi.repository import Adw, Gtk
 
+from hyprmod.core import config
 from hyprmod.core.env_vars import RESERVED_NAMES, EnvVar
-from hyprmod.ui import build_preview_group
+from hyprmod.ui import build_preview_group, format_config_preview
 from hyprmod.ui.dialog import SingletonDialogMixin
 
 # POSIX environment variable name: leading letter or underscore, then any
@@ -80,7 +81,7 @@ class EnvVarEditDialog(SingletonDialogMixin, Adw.Dialog):
             title = "Edit Environment Variable"
         self.set_title(title)
         self.set_content_width(540)
-        self.set_follows_content_size(True)
+        self.set_content_height(420)
 
         toolbar = Adw.ToolbarView()
 
@@ -186,7 +187,9 @@ class EnvVarEditDialog(SingletonDialogMixin, Adw.Dialog):
         rule = self._build_entry()
 
         if rule is not None:
-            self._preview_label.set_text(rule.to_line())
+            self._preview_label.set_text(
+                format_config_preview(config.KEYWORD_ENV, f"{rule.name},{rule.value}")
+            )
         else:
             self._preview_label.set_text("(entry incomplete)")
 

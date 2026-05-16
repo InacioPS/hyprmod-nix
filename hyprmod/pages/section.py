@@ -25,9 +25,11 @@ and layer-rules use keyboard-only reorder for now.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any
+from html import escape as html_escape
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from gi.repository import Adw, Gdk, GLib, GObject, Gtk
 
@@ -36,8 +38,12 @@ from hyprmod.core.change_tracking import (
     count_pending_changes,
     detect_reorder,
     drop_target_idx,
+    iter_item_changes,
 )
 from hyprmod.core.ownership import SavedList
+from hyprmod.core.pending import ChangeKind, PendingChange
+from hyprmod.core.undo import SavedListSnapshot
+from hyprmod.ui import clear_children, display_path
 
 if TYPE_CHECKING:
     from hyprmod.core.undo import UndoEntry
@@ -67,6 +73,14 @@ class SectionPage(ABC):
 
     @abstractmethod
     def discard(self) -> None: ...
+
+    # ── pending-changes (default: no entries) ──
+    #
+    # Pages that surface their dirty state in the Pending Changes view
+    # override this to yield one :class:`PendingChange` per item.
+
+    def iter_pending_changes(self) -> Iterable[PendingChange]:
+        return ()
 
     # ── shared scaffolding ──
 
@@ -142,23 +156,199 @@ class SavedListSectionPage[T: LineSerialisable](SectionPage):
       ``discard``, ``reload_from_saved``) — pages that need extra
       runtime sync (e.g. window-rules) override and call ``super``.
 
-    Subclasses must initialise ``self._owned`` and ``self._rows_by_idx``
-    in ``__init__``, implement ``_rebuild_list`` and ``_load``.
+    Subclasses must initialise ``self._owned`` in ``__init__`` (after
+    ``super().__init__``), implement ``_load``, ``_make_row``, ``_on_add``,
+    and ``_build_empty_state``. The default :meth:`_rebuild_list` handles
+    the standard skeleton (order-hint, managed group(s), deleted, external,
+    empty); pages that need pre-rebuild snapshot work override
+    :meth:`_pre_rebuild`, and pages with non-single-group layouts (autostart
+    splits ``exec`` vs ``exec-once``) override :meth:`_build_managed_groups`.
     """
 
-    # Subclasses set these in __init__ before any base method runs.
+    # Subclasses set this in __init__ before any base method runs.
     _owned: SavedList[T]
-    _rows_by_idx: list[Adw.ActionRow | None]
+    # The vertical content box the shared :meth:`_rebuild_list` populates.
+    # Subclasses assign this from ``make_page_layout`` in their ``build()``.
+    _content_box: Gtk.Box
 
-    # ── List rendering & loading (subclass implements) ──
+    # The window attribute that holds this page instance — used by the
+    # undo-redo dispatch to look the page up when replaying a snapshot.
+    # Subclasses must set this so the shared ``_build_undo_entry`` below
+    # can stamp the snapshot with the right page.
+    _page_attr: ClassVar[str]
 
-    def _rebuild_list(self, focus_idx: int = -1) -> None:
-        """Repaint the list. ``focus_idx`` re-focuses the row at that index."""
-        raise NotImplementedError
+    # Pending-changes display metadata — subclasses set these so the
+    # shared ``iter_pending_changes`` below can stamp each emitted
+    # :class:`PendingChange` without each page reimplementing the loop.
+    _pending_category: ClassVar[str]
+    _pending_navigate_to: ClassVar[str]
+    _pending_icon: ClassVar[str]
+
+    # Default managed-group rendering knobs. Pages with a single managed
+    # group (window-rules, layer-rules, env-vars) set these; multi-group
+    # pages (autostart) override :meth:`_build_managed_groups` directly
+    # and these go unused.
+    _group_title: ClassVar[str] = ""
+    _group_add_tooltip: ClassVar[str] = "Add another entry"
+
+    # Read-only icon used by :meth:`_build_external_row` for the prefix on
+    # external rows. Pages with an external section set this; pages without
+    # (autostart) leave it blank.
+    _external_prefix_icon: ClassVar[str] = ""
+
+    def __init__(
+        self,
+        window: "HyprModWindow",
+        on_dirty_changed: Callable[[], None] | None = None,
+        push_undo: Callable[["UndoEntry"], None] | None = None,
+    ):
+        super().__init__(window, on_dirty_changed, push_undo)
+        # Per-instance defaults so subclasses don't have to remember to
+        # init them (and so the mutable list isn't shared across pages
+        # via a class attribute).
+        self._rows_by_idx: list[Adw.ActionRow | None] = []
+        self._external: list[Any] = []
+
+    # ── Subclass hooks ──
 
     def _load(self, saved_sections: dict[str, list[str]] | None) -> None:
         """Re-read ``self._owned`` from *saved_sections* (or the live config)."""
         raise NotImplementedError
+
+    def _make_row(self, idx: int, item: T) -> Adw.ActionRow:
+        """Build the managed-content row for *item* at index *idx*."""
+        raise NotImplementedError
+
+    def _on_add(self) -> None:
+        """Open the add dialog. Bound to managed-group "+" buttons."""
+        raise NotImplementedError
+
+    def _build_empty_state(self) -> Gtk.Widget:
+        """Build the empty-state widget shown when nothing is in the list."""
+        raise NotImplementedError
+
+    # Optional hooks (default no-op).
+
+    def _pre_rebuild(self) -> None:
+        """Snapshot computations needed before rendering. Override for env-vars."""
+
+    def _build_order_hint(self) -> Gtk.Widget | None:
+        """Reorder-hint widget, shown when ``len(self._owned) >= 2``.
+
+        Default ``None`` skips the hint. Pages that benefit from it
+        (window/layer rules, env-vars, autostart) override to return a
+        :func:`make_inline_hint` widget.
+        """
+        return None
+
+    # ── Standard list rendering ──
+
+    def _rebuild_list(self, focus_idx: int = -1) -> None:
+        """Repaint the list. ``focus_idx`` re-focuses the row at that index.
+
+        Standard layout: order-hint, managed group(s), deleted-baseline
+        group, external section, empty state — in that order. Pages with
+        non-default layout (e.g. autostart's per-keyword grouping)
+        override :meth:`_build_managed_groups`.
+        """
+        self._pre_rebuild()
+        clear_children(self._content_box)
+        self._rows_by_idx = [None] * len(self._owned)
+
+        if len(self._owned) >= 2:
+            hint = self._build_order_hint()
+            if hint is not None:
+                self._content_box.append(hint)
+
+        for widget in self._build_managed_groups():
+            self._content_box.append(widget)
+
+        deleted = self._deleted_baselines()
+        if deleted:
+            self._content_box.append(self._build_deleted_group(deleted))
+
+        if self._external:
+            for widget in self._build_external_section():
+                self._content_box.append(widget)
+
+        if len(self._owned) == 0 and not deleted and not self._external:
+            self._content_box.append(self._build_empty_state())
+
+        if 0 <= focus_idx < len(self._rows_by_idx):
+            target = self._rows_by_idx[focus_idx]
+            if target is not None:
+                # Defer to idle so the row is mapped before grab_focus runs
+                # (see :meth:`_grab_focus_once` for the SOURCE_REMOVE rationale).
+                GLib.idle_add(self._grab_focus_once, target)
+
+    def _build_managed_groups(self) -> list[Gtk.Widget]:
+        """Build the managed-content group(s).
+
+        Default: a single :class:`Adw.PreferencesGroup` built via
+        :meth:`_build_managed_group` (or none if the list is empty).
+        Override for layouts that split the items into multiple groups
+        (autostart's ``exec`` vs ``exec-once``).
+        """
+        if len(self._owned) == 0:
+            return []
+        return [self._build_managed_group(self._group_title, range(len(self._owned)))]
+
+    def _build_managed_group(self, title: str, indices: range | list[int]) -> Adw.PreferencesGroup:
+        """Standard managed group: title, ``N <unit>`` description, header "+", rows.
+
+        *indices* is the slice of ``self._owned`` to render. The default
+        single-group layout passes the full range; multi-group pages
+        (autostart) call this once per keyword with the matching indices.
+        """
+        idx_list = list(indices)
+        n = len(idx_list)
+        group = Adw.PreferencesGroup(title=title)
+        group.set_description(f"{n} {self._unit_label(n)}")
+
+        add_btn = Gtk.Button(icon_name="list-add-symbolic")
+        add_btn.set_valign(Gtk.Align.CENTER)
+        add_btn.add_css_class("flat")
+        add_btn.set_tooltip_text(self._group_add_tooltip)
+        add_btn.connect("clicked", lambda _b: self._on_add())
+        group.set_header_suffix(add_btn)
+
+        for idx in idx_list:
+            group.add(self._make_row(idx, self._owned[idx]))
+        return group
+
+    # ── Undo / Redo (default implementations) ──
+
+    def _capture_undo(self) -> tuple[list[T], list[T | None]]:
+        return self._owned.snapshot()
+
+    def _undo_key(self) -> list[str]:
+        return [e.to_line() for e in self._owned]
+
+    def _build_undo_entry(
+        self,
+        old: tuple[list[T], list[T | None]],
+        new: tuple[list[T], list[T | None]],
+    ) -> SavedListSnapshot:
+        old_items, old_baselines = old
+        new_items, new_baselines = new
+        return SavedListSnapshot(
+            page_attr=self._page_attr,
+            old_items=old_items,
+            new_items=new_items,
+            old_baselines=old_baselines,
+            new_baselines=new_baselines,
+        )
+
+    def restore_snapshot(self, items: list[T], baselines: list[T | None]) -> None:
+        """Restore state from an undo/redo snapshot.
+
+        Default behaviour: rewind ``_owned`` and repaint. Pages that need
+        runtime side effects (e.g. window-rules re-syncing setprop overrides)
+        override this and call ``super``.
+        """
+        self._owned.restore(items, baselines)
+        self._rebuild_list()
+        self._notify_dirty()
 
     # ── SectionPage lifecycle (default implementations) ──
 
@@ -332,6 +522,280 @@ class SavedListSectionPage[T: LineSerialisable](SectionPage):
         self._notify_dirty()
         self._rebuild_list()
 
+    # ── Pending changes (subclasses provide the per-item summarizers) ──
+    #
+    # The added/modified/removed iteration and the reorder roll-up are
+    # identical across every SavedList-backed page. Subclasses only
+    # implement ``_summarize_item`` (for added/removed entries) and
+    # ``_summarize_modified`` (for the baseline → item diff).
+
+    def _summarize_item(self, item: T) -> tuple[str, str]:
+        """Return ``(title, subtitle)`` for a fresh or deleted item."""
+        raise NotImplementedError
+
+    def _summarize_modified(self, baseline: T, item: T) -> tuple[str, str]:
+        """Return ``(title, subtitle)`` for a modified item; subtitle shows the diff."""
+        raise NotImplementedError
+
+    def iter_pending_changes(self) -> Iterator[PendingChange]:
+        if not self.is_dirty():
+            return
+        baselines = [self._owned.get_baseline(i) for i in range(len(self._owned))]
+        for kind, idx, item, baseline in iter_item_changes(
+            self._owned.saved, list(self._owned), baselines
+        ):
+            if kind == "added":
+                title, subtitle = self._summarize_item(item)
+                yield self._make_pending(
+                    kind="added",
+                    title=title,
+                    subtitle=f"new · {subtitle}",
+                    revert=lambda i=idx: self._discard_at(i),
+                )
+            elif kind == "modified" and baseline is not None:
+                title, subtitle = self._summarize_modified(baseline, item)
+                yield self._make_pending(
+                    kind="modified",
+                    title=title,
+                    subtitle=subtitle,
+                    revert=lambda i=idx: self._discard_at(i),
+                )
+            elif kind == "removed":
+                title, subtitle = self._summarize_item(item)
+                yield self._make_pending(
+                    kind="removed",
+                    title=title,
+                    subtitle=f"deleted · {subtitle}",
+                    revert=lambda e=item: self._on_restore_deleted(e),
+                )
+        if self.is_reordered():
+            common = len(
+                {e.to_line() for e in self._owned} & {b.to_line() for b in self._owned.saved}
+            )
+            yield self._make_pending(
+                kind="modified",
+                title="Reordered",
+                subtitle=f"{common} {self._unit_label(common)} in a different order",
+                revert=self.revert_reorder,
+            )
+
+    def _make_pending(
+        self,
+        *,
+        kind: ChangeKind,
+        title: str,
+        subtitle: str,
+        revert: Callable[[], None],
+    ) -> PendingChange:
+        """Build a :class:`PendingChange` stamped with the page's class metadata."""
+        return PendingChange(
+            category=self._pending_category,
+            title=title,
+            subtitle=subtitle,
+            kind=kind,
+            revert=revert,
+            navigate_to=self._pending_navigate_to,
+            icon=self._pending_icon,
+        )
+
+    # ── Item CRUD (default vanilla; subclasses override for side effects) ──
+
+    def _commit_appended(self, item: T) -> None:
+        """Append *item* to the owned list and repaint."""
+        with self._undo_track():
+            self._owned.append_new(item)
+        self._notify_dirty()
+        self._rebuild_list()
+
+    def _commit_replaced(self, idx: int, item: T) -> None:
+        """Replace the owned entry at *idx* with *item* and repaint."""
+        with self._undo_track():
+            self._owned[idx] = item
+        self._notify_dirty()
+        self._rebuild_list()
+
+    def _on_delete_at(self, idx: int) -> None:
+        """Remove the entry at *idx* from the owned list.
+
+        Pure SavedList mutation. Pages that need to propagate side
+        effects to the running compositor (e.g. window-rules clearing
+        per-window setprop overrides) override this and call ``super``
+        — or do their own thing entirely.
+        """
+        if idx < 0 or idx >= len(self._owned):
+            return
+        with self._undo_track():
+            self._owned.pop_at(idx)
+        self._notify_dirty()
+        self._rebuild_list()
+
+    def _discard_at(self, idx: int) -> None:
+        """Revert the entry at *idx* to its saved value, or delete if unsaved."""
+        baseline = self._owned.get_baseline(idx)
+        if baseline is None:
+            self._on_delete_at(idx)
+            return
+        with self._undo_track():
+            self._owned.discard_at(idx)
+        self._notify_dirty()
+        self._rebuild_list()
+
+    def _on_restore_deleted(self, item: T) -> None:
+        """Restore a previously-deleted *item* to its saved slot.
+
+        Routes through :meth:`SavedList.restore_deleted` so the row
+        comes back with its saved baseline at the slot consistent with
+        the saved order — a pure delete-then-restore round trip leaves
+        the page non-dirty.
+        """
+        with self._undo_track():
+            self._owned.restore_deleted(item)
+        self._notify_dirty()
+        self._rebuild_list()
+
+    # ── Shared rendering: deleted group + external section ──
+    #
+    # Subclasses set the noun pair via class attrs and (where relevant)
+    # implement ``_deleted_row_summary`` for the default deleted-row
+    # render, ``_make_external_row`` for the external-section row, and
+    # ``_build_external_hint`` for the inline note above it. Pages with
+    # richer rendering can override ``_make_deleted_row`` or the entire
+    # ``_build_deleted_group`` (autostart currently does the latter).
+
+    # Noun used in pluralisation copy ("1 rule" / "2 rules", "1 entry"
+    # / "2 entries"). Default reads naturally for autostart entries;
+    # other pages override.
+    _unit_singular: str = "entry"
+    _unit_plural: str = "entries"
+    # How many subtitle lines the default deleted-row renders.
+    # Window/layer rules with long matcher regexes set this to 2.
+    _deleted_subtitle_lines: int = 1
+
+    def _unit_label(self, n: int) -> str:
+        """Pluralised noun for *n* entries ('1 rule' / '5 rules')."""
+        return self._unit_singular if n == 1 else self._unit_plural
+
+    def _build_deleted_group(self, deleted: list[T]) -> Adw.PreferencesGroup:
+        """Render the "Removed (pending save)" group for *deleted* items."""
+        group = Adw.PreferencesGroup(title="Removed (pending save)")
+        n = len(deleted)
+        group.set_description(f"{n} {self._unit_label(n)} will be removed on save")
+        for item in deleted:
+            group.add(self._make_deleted_row(item))
+        return group
+
+    def _make_deleted_row(self, item: T) -> Adw.ActionRow:
+        """Default deleted-row factory; subclasses override for rich rendering.
+
+        Uses :meth:`_deleted_row_summary` for the (title, subtitle) pair and
+        attaches a restore button wired to :meth:`_on_restore_deleted`.
+        """
+        title, subtitle = self._deleted_row_summary(item)
+        row = Adw.ActionRow(
+            title=html_escape(title),
+            subtitle=html_escape(subtitle),
+        )
+        row.set_title_lines(1)
+        row.set_subtitle_lines(self._deleted_subtitle_lines)
+        row.add_css_class("option-default")
+        row.set_opacity(0.65)
+
+        restore_btn = Gtk.Button(icon_name="edit-undo-symbolic")
+        restore_btn.set_valign(Gtk.Align.CENTER)
+        restore_btn.add_css_class("flat")
+        restore_btn.set_tooltip_text(f"Restore this {self._unit_singular}")
+        restore_btn.connect("clicked", lambda _b, e=item: self._on_restore_deleted(e))
+        row.add_suffix(restore_btn)
+        return row
+
+    def _deleted_row_summary(self, item: T) -> tuple[str, str]:
+        """``(title, subtitle)`` for the default :meth:`_make_deleted_row`.
+
+        Subclasses that don't override ``_make_deleted_row`` must implement
+        this. Defaults to ``(str(item), "")`` so the abstract intent surfaces
+        as garbled but legible output rather than an exception if a subclass
+        forgets to override.
+        """
+        return str(item), ""
+
+    # External section — read-only display of items from outside our managed
+    # file. Subclasses with external entries populate ``self._external`` in
+    # ``_load``; pages without external entries inherit the empty default.
+
+    def _build_external_section(self) -> list[Gtk.Widget]:
+        """Build the read-only external-entry display.
+
+        Returns an inline hint widget plus one ``Adw.PreferencesGroup``
+        per source file. Subclasses with richer per-rebuild context
+        (e.g. env-vars' "overridden by managed" computation) can override
+        this method directly and call :meth:`_build_external_file_group`
+        for the file-grouped portion.
+        """
+        widgets: list[Gtk.Widget] = [self._build_external_hint()]
+        by_file: dict[Path, list] = {}
+        for ext in self._external:
+            by_file.setdefault(ext.source_path, []).append(ext)
+        for source_path, entries in by_file.items():
+            widgets.append(self._build_external_file_group(source_path, entries))
+        return widgets
+
+    def _build_external_file_group(
+        self,
+        source_path: Path,
+        entries: list,
+    ) -> Adw.PreferencesGroup:
+        """A ``PreferencesGroup`` containing every external entry from one file."""
+        group = Adw.PreferencesGroup(title=display_path(source_path))
+        n = len(entries)
+        group.set_description(f"{n} {self._unit_label(n)}")
+        for ext in entries:
+            group.add(self._make_external_row(ext))
+        return group
+
+    def _make_external_row(self, ext: Any) -> Adw.ActionRow:
+        """Build a read-only row for one external entry. Subclasses override."""
+        raise NotImplementedError
+
+    def _make_readonly_external_row(
+        self,
+        title: str,
+        subtitle: str,
+        source_path: Path,
+        lineno: int,
+    ) -> Adw.ActionRow:
+        """Standard read-only external row: dimmed prefix icon, lock-icon suffix.
+
+        Used by window-rules and layer-rules — same shape with only the
+        prefix icon differing (set via ``_external_prefix_icon``). Pages
+        with richer external rows (env-vars' override button / Overridden
+        badge) override :meth:`_make_external_row` directly instead.
+        """
+        row = Adw.ActionRow(
+            title=html_escape(title),
+            subtitle=html_escape(subtitle),
+        )
+        row.set_title_lines(1)
+        row.set_subtitle_lines(1)
+        row.add_css_class("option-default")
+        row.set_opacity(0.65)
+        row.set_tooltip_text(f"{source_path}:{lineno}")
+
+        if self._external_prefix_icon:
+            prefix = Gtk.Image.new_from_icon_name(self._external_prefix_icon)
+            prefix.set_opacity(0.4)
+            prefix.set_pixel_size(28)
+            row.add_prefix(prefix)
+
+        lock_icon = Gtk.Image.new_from_icon_name("changes-prevent-symbolic")
+        lock_icon.set_opacity(0.4)
+        lock_icon.set_valign(Gtk.Align.CENTER)
+        row.add_suffix(lock_icon)
+        return row
+
+    def _build_external_hint(self) -> Gtk.Widget:
+        """Inline-hint widget rendered above the external section."""
+        raise NotImplementedError
+
 
 class DragDropReorderMixin[T: LineSerialisable](SavedListSectionPage[T]):
     """Whole-row drag-and-drop reorder for :class:`SavedListSectionPage`.
@@ -350,19 +814,22 @@ class DragDropReorderMixin[T: LineSerialisable](SavedListSectionPage[T]):
     motion crosses its threshold.
     """
 
-    # Index of the row currently being dragged (``None`` when no drag is in
-    # progress). Read by ``motion`` to validate drops synchronously without
-    # waiting for the drag value to resolve.
-    _dragging_idx: int | None
-    # ``(x, y)`` of the press that started the current drag, in source-row-local
-    # coords. Stashed by ``drag-prepare`` for ``drag-begin`` to use as the
-    # icon's hot spot. ``None`` when no drag is active.
-    _drag_press: tuple[float, float] | None
-
-    def _init_drag_state(self) -> None:
-        """Initialise drag-state attributes — call from subclass ``__init__``."""
-        self._dragging_idx = None
-        self._drag_press = None
+    def __init__(
+        self,
+        window: "HyprModWindow",
+        on_dirty_changed: Callable[[], None] | None = None,
+        push_undo: Callable[["UndoEntry"], None] | None = None,
+    ):
+        super().__init__(window, on_dirty_changed, push_undo)
+        # Index of the row currently being dragged (``None`` when no drag
+        # is in progress). Read by ``motion`` to validate drops synchronously
+        # without waiting for the drag value to resolve.
+        self._dragging_idx: int | None = None
+        # ``(x, y)`` of the press that started the current drag, in
+        # source-row-local coords. Stashed by ``drag-prepare`` for
+        # ``drag-begin`` to use as the icon's hot spot. ``None`` when no
+        # drag is active.
+        self._drag_press: tuple[float, float] | None = None
 
     def _attach_drag_source(self, row: Adw.ActionRow, idx: int) -> None:
         """Make *row* the source of a same-list reorder drag."""

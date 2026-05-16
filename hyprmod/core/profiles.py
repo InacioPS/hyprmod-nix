@@ -1,6 +1,10 @@
 """Profile management — self-contained with IPC activate().
 
-Profiles are stored in HYPRMOD_DIR/<profile_id>/ directories.
+Profiles are stored in HYPRMOD_DIR/<profile_id>/ directories. Each
+profile's snapshot is whichever format hyprmod was writing at snapshot
+time (``.conf`` or ``.lua``); on activation the snapshot is loaded
+format-agnostically via :func:`hyprland_config.load_any` and re-written
+in the format the user is currently on.
 """
 
 import json
@@ -9,18 +13,18 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from hyprland_config import atomic_write
+import hyprland_config
+from hyprland_config import Assignment, atomic_write, load_any, serialize_any
 from hyprland_state import HyprlandState
 
-from hyprmod.core.config import HYPRMOD_DIR, gui_conf, parse_conf
+from hyprmod.core.config import HYPRMOD_DIR, invalidate_cache, managed_path
 
 _PROFILES_DIR = HYPRMOD_DIR / "profiles"
 _META_FILE = "meta.json"
 _ACTIVE_FILE = HYPRMOD_DIR / "active_profile"
 
 # Profile IDs are 12 hex chars (48 bits) — long enough that collisions are
-# astronomically unlikely with the dozens of profiles a single user creates,
-# short enough that the directory name stays readable.
+# astronomically unlikely, short enough that the directory name stays readable.
 _PROFILE_ID_LEN = 12
 
 
@@ -44,10 +48,63 @@ def _write_meta(profile_id: str, meta: dict) -> None:
     atomic_write(meta_path, json.dumps(meta, indent=2) + "\n")
 
 
-def _copy_file_atomic(src: Path, dest: Path) -> None:
-    """Copy a file atomically — read content, then write via atomic_write."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write(dest, src.read_text())
+def _find_snapshot(profile_id: str) -> Path | None:
+    """Return the snapshot inside the profile dir, or ``None`` if absent.
+
+    Looks up the snapshot's filename from the profile's meta (recorded at
+    save time). Profiles written before the meta entry existed don't have
+    the field; we fall back to a best-effort lookup that prefers the
+    active managed-path basename and finally the legacy default name.
+    """
+    pdir = _profile_dir(profile_id)
+    meta = _read_meta(profile_id)
+    recorded = meta.get("snapshot")
+    if isinstance(recorded, str) and recorded:
+        candidate = pdir / recorded
+        if candidate.exists():
+            return candidate
+
+    # Legacy fallback for profiles created before ``snapshot`` was tracked.
+    # TODO: remove after legacy profiles are migrated in the field.
+    active = pdir / managed_path().name
+    if active.exists():
+        return active
+    for suffix in (".lua", ".conf"):
+        candidate = pdir / f"hyprland-gui{suffix}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _snapshot_current(pdir: Path) -> str | None:
+    """Copy the live managed file into *pdir*, preserving its suffix.
+
+    Returns the snapshot's basename when a copy was made, or ``None`` if
+    the managed file is absent. Callers persist the basename in the
+    profile meta so :func:`_find_snapshot` can locate it without
+    inferring the format from the active mode.
+    """
+    src = managed_path()
+    if not src.exists():
+        return None
+    pdir.mkdir(parents=True, exist_ok=True)
+    atomic_write(pdir / src.name, src.read_text())
+    return src.name
+
+
+def _write_managed_from_snapshot(snapshot: Path) -> None:
+    """Write *snapshot* to ``managed_path()``, transcoding format if needed.
+
+    Profiles created in one mode (e.g. Hyprlang) need to survive a switch
+    to the other (Lua) — re-emit through the right serializer when the
+    suffixes diverge.
+    """
+    target = managed_path()
+    if snapshot.suffix == target.suffix:
+        atomic_write(target, snapshot.read_text())
+    else:
+        atomic_write(target, serialize_any(load_any(snapshot), target))
+    invalidate_cache()
 
 
 def _now_iso() -> str:
@@ -93,29 +150,31 @@ def list_profiles_and_active() -> tuple[list[dict], str | None]:
 
 
 def read_profile_values(profile_id: str) -> dict[str, str]:
-    """Read the saved config values for a profile."""
-    conf_path = _profile_dir(profile_id) / "hyprland-gui.conf"
-    return parse_conf(conf_path)
+    """Read the saved option values for a profile (format-agnostic)."""
+    snapshot = _find_snapshot(profile_id)
+    if snapshot is None:
+        return {}
+    try:
+        doc = load_any(snapshot, follow_sources=False, lenient=True)
+    except (OSError, hyprland_config.ParseError):
+        return {}
+    return {line.full_key: line.value for line in doc.lines if isinstance(line, Assignment)}
 
 
 def save_current_as(name: str, description: str = "") -> str:
     """Snapshot the current managed config as a new profile. Returns the profile ID."""
     profile_id = uuid.uuid4().hex[:_PROFILE_ID_LEN]
-    pdir = _profile_dir(profile_id)
-    pdir.mkdir(parents=True, exist_ok=True)
-    conf_dest = pdir / "hyprland-gui.conf"
-    if gui_conf().exists():
-        _copy_file_atomic(gui_conf(), conf_dest)
+    snapshot_name = _snapshot_current(_profile_dir(profile_id))
     now = _now_iso()
-    _write_meta(
-        profile_id,
-        {
-            "name": name,
-            "description": description,
-            "created_at": now,
-            "modified_at": now,
-        },
-    )
+    meta: dict = {
+        "name": name,
+        "description": description,
+        "created_at": now,
+        "modified_at": now,
+    }
+    if snapshot_name is not None:
+        meta["snapshot"] = snapshot_name
+    _write_meta(profile_id, meta)
     set_active_id(profile_id)
     return profile_id
 
@@ -125,21 +184,20 @@ def update(profile_id: str) -> None:
     pdir = _profile_dir(profile_id)
     if not pdir.exists():
         return
-    conf_dest = pdir / "hyprland-gui.conf"
-    if gui_conf().exists():
-        _copy_file_atomic(gui_conf(), conf_dest)
+    snapshot_name = _snapshot_current(pdir)
     meta = _read_meta(profile_id)
     meta["modified_at"] = _now_iso()
+    if snapshot_name is not None:
+        meta["snapshot"] = snapshot_name
     _write_meta(profile_id, meta)
 
 
 def activate_meta(profile_id: str) -> bool:
-    """Set a profile as active and copy its snapshot to the managed config path."""
-    pdir = _profile_dir(profile_id)
-    conf_src = pdir / "hyprland-gui.conf"
-    if not conf_src.exists():
+    """Set a profile as active and write its snapshot to the managed path."""
+    snapshot = _find_snapshot(profile_id)
+    if snapshot is None:
         return False
-    _copy_file_atomic(conf_src, gui_conf())
+    _write_managed_from_snapshot(snapshot)
     set_active_id(profile_id)
     return True
 
@@ -189,13 +247,13 @@ def duplicate(profile_id: str) -> str:
     if src.exists():
         shutil.copytree(src, dst)
     now = _now_iso()
-    _write_meta(
-        new_id,
-        {
-            "name": f"{meta.get('name', 'Untitled')} (copy)",
-            "description": meta.get("description", ""),
-            "created_at": now,
-            "modified_at": now,
-        },
-    )
+    new_meta: dict = {
+        "name": f"{meta.get('name', 'Untitled')} (copy)",
+        "description": meta.get("description", ""),
+        "created_at": now,
+        "modified_at": now,
+    }
+    if "snapshot" in meta:
+        new_meta["snapshot"] = meta["snapshot"]
+    _write_meta(new_id, new_meta)
     return new_id

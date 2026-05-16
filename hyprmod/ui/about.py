@@ -15,8 +15,9 @@ from importlib.metadata import PackageNotFoundError, version
 from gi.repository import Adw, Gtk
 from hyprland_schema import HYPRLAND_VERSION
 
+from hyprmod.constants import APPLICATION_ID
+
 APPLICATION_NAME = "HyprMod"
-APPLICATION_ID = "io.github.bluemancz.hyprmod"
 DEVELOPER_NAME = "Ivo Šmerek"
 COPYRIGHT = "© 2026 Ivo Šmerek"
 COMMENTS = "A native GTK4/libadwaita settings app for Hyprland"

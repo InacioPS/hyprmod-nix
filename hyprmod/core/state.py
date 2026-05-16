@@ -14,29 +14,6 @@ from hyprmod.core.undo import OptionChange
 log = logging.getLogger(__name__)
 
 
-def _normalize_gradient_string(value: str) -> str:
-    """Add ``0x`` prefix to bare ``AARRGGBB`` hex tokens in a gradient string.
-
-    Hyprland's IPC reports gradients as bare hex tokens followed by an angle
-    (``"eeb4e718 ee00ff99 45deg"``), but the config-file parser requires
-    ``0x``-prefixed colors. Defensive normalization here — once we depend on
-    ``hyprland-state>=0.2.1`` which fixes this at the IPC layer, this helper
-    becomes redundant and can be removed.
-    """
-    tokens = value.split()
-    if not tokens or not tokens[-1].endswith("deg"):
-        return value
-    out: list[str] = []
-    for token in tokens:
-        if token.endswith("deg") or token.startswith("0x") or "(" in token:
-            out.append(token)
-        elif len(token) == 8 and all(c in "0123456789abcdefABCDEF" for c in token):
-            out.append(f"0x{token}")
-        else:
-            out.append(token)
-    return " ".join(out)
-
-
 @dataclass(slots=True)
 class OptionState:
     """State of a single option being tracked by AppState."""
@@ -80,21 +57,28 @@ class AppState:
         self,
         key: str,
         default_value: Any,
-        saved_value: Any,
+        was_managed_value: Any,
         *,
         digits: int | None = None,
     ):
-        """Register an option with its default and saved values."""
+        """Register an option, seeding the saved baseline from the live value.
+
+        *was_managed_value* is the on-disk value (or ``None`` if absent).
+        Its truthy-ness decides whether hyprmod currently *manages* this
+        key — but the actual baseline becomes the live IPC value, so
+        ``is_dirty`` tracks "user changed something this session" rather
+        than "live differs from disk." Without that, every startup where
+        a user previously ran ``hyprctl keyword …`` by hand would show
+        the unsaved-changes banner immediately.
+        """
         if digits is not None:
             self._precisions[key] = digits
 
         live_value, available = self._hypr.get_live(key, default_value)
         if not available:
-            live_value = saved_value if saved_value is not None else default_value
-        if isinstance(live_value, str):
-            live_value = _normalize_gradient_string(live_value)
+            live_value = was_managed_value if was_managed_value is not None else default_value
         live_value = self.normalize(key, live_value)
-        managed = saved_value is not None
+        managed = was_managed_value is not None
 
         self.options[key] = OptionState(
             key=key,
@@ -142,9 +126,12 @@ class AppState:
         if state is None:
             return False
         value = self.normalize(key, value)
-        ipc_value = value_to_conf(value) if isinstance(value, str) else value
-        if self._hypr.apply(key, ipc_value, validate=False):
-            state.live_value = ipc_value
+        # String values come in raw and need to be canonicalised before
+        # they round-trip back through IPC; non-strings are already in
+        # their target Python type and pass through unchanged.
+        coerced = value_to_conf(value) if isinstance(value, str) else value
+        if self._hypr.apply(key, coerced, validate=False):
+            state.live_value = coerced
             state.managed = managed
             self.notify(key)
             return True
@@ -201,42 +188,18 @@ class AppState:
         self.notify(key)
         return True
 
-    def reload_preserving_dirty(self, *, exclude: str | None = None):
+    def reload_preserving_dirty(self):
         """Reload Hyprland config, then re-apply any unsaved live values.
 
         A reload resets Hyprland to what's on disk, losing in-memory
         dirty values. This method re-applies them after the reload.
-        *exclude* optionally skips one key (the one being reset).
         """
         self._hypr.reload_compositor()
         for key, value in self.get_dirty_values().items():
-            if key != exclude:
-                try:
-                    self._hypr.keyword(key, value)
-                except HyprlandError:
-                    log.warning("Failed to re-apply %s after reload", key)
-
-    def refresh_live(self, key: str, reset_baseline: bool = False) -> Any | None:
-        """Re-read the live value from Hyprland and update the state.
-
-        If reset_baseline is True, also updates initial_value so the option
-        is no longer considered modified.
-
-        Returns the new live value, or None if the read failed.
-        """
-        state = self.options.get(key)
-        if state is None:
-            return None
-        value, available = self._hypr.get_live(key, state.default_value)
-        if not available:
-            return None
-        value = self.normalize(key, value)
-        state.live_value = value
-        state.saved_value = value
-        if reset_baseline:
-            state.initial_value = value
-        self.notify(key)
-        return value
+            try:
+                self._hypr.keyword(key, value)
+            except HyprlandError:
+                log.warning("Failed to re-apply %s after reload", key)
 
     def refresh_all_live(self):
         """Re-read all registered options from Hyprland and reset baselines.
@@ -250,8 +213,6 @@ class AppState:
             value, available = self._hypr.get_live(key, state.default_value)
             if not available:
                 continue
-            if isinstance(value, str):
-                value = _normalize_gradient_string(value)
             value = self.normalize(key, value)
             if value != state.live_value:
                 changed_keys.append(key)
@@ -283,25 +244,21 @@ class AppState:
     def discard_dirty(self) -> dict[str, Any]:
         """Revert all dirty options to their saved values via IPC.
 
-        Delegates the IPC revert to ``HyprlandState.discard()``, then
-        resets managed state to match what's on the disk. For options not
-        found in any config file, applies the saved value directly.
+        ``HyprlandState.discard()`` handles the IPC revert (using on-disk
+        values, falling back to schema defaults); this method then mirrors
+        the result into the per-option ``OptionState`` so the UI reflects
+        the post-revert state.
 
-        Returns dict of key -> saved_value for options that were reverted.
+        Returns the dict ``HyprlandState.discard()`` produced — key →
+        reverted compositor value (or ``None`` when neither the document
+        nor the schema had a value to revert to).
         """
         reverted = self._hypr.discard()
         for key, s in self.options.items():
             if key in reverted:
-                # If the library couldn't revert (option not in any config file),
-                # send the saved value via IPC directly.
-                if reverted[key] is None and s.saved_value is not None:
-                    try:
-                        self._hypr.keyword(key, value_to_conf(s.saved_value))
-                    except HyprlandError:
-                        log.warning("Failed to discard %s via IPC", key)
                 s.live_value = s.saved_value
             # Restore managed flags for all dirty options (including those
-            # where only the managed flag changed without a value change)
+            # where only the managed flag changed without a value change).
             if s.managed != s.saved_managed:
                 s.managed = s.saved_managed
         return reverted

@@ -1,6 +1,7 @@
 """Cursor theme selection page — thumbnails, size, live apply."""
 
 import subprocess
+from collections.abc import Iterator
 from typing import NamedTuple, cast
 
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango
@@ -10,9 +11,11 @@ from hyprmod.core import config
 from hyprmod.core.cursor_themes import CursorTheme, discover
 from hyprmod.core.env_vars import RESERVED_NAMES as _MANAGED_VARS
 from hyprmod.core.env_vars import parse_env_lines
+from hyprmod.core.pending import PendingChange
 from hyprmod.core.undo import CursorUndoEntry
 from hyprmod.core.xcursor import crop_to_content, load_pointer, pad_to_square, scale_nearest
 from hyprmod.pages.section import SectionPage
+from hyprmod.ui.icons import CURSOR_ICON
 from hyprmod.ui.managed_row import ManagedRow, make_combo_row
 from hyprmod.ui.timer import Timer
 
@@ -83,7 +86,6 @@ class CursorPage(SectionPage):
         self._baseline = self._parse_env(saved_sections or {})
         self._current = _State(self._baseline.theme, self._baseline.size)
         self._last_pushed = _State(self._current.theme, self._current.size)
-        self._suspend_undo = False
 
         self._model: Gio.ListStore | None = None
         self._size_adjustment: Gtk.Adjustment | None = None
@@ -91,6 +93,11 @@ class CursorPage(SectionPage):
         self._theme_row: Adw.ComboRow | None = None
         self._field: ManagedRow | None = None
         self._apply_timer = Timer()
+        # Handler ids of the user-interaction signals so silent setters
+        # can block them around programmatic widget mutation (avoiding
+        # the boolean-flag anti-pattern).
+        self._theme_handler_id: int = 0
+        self._size_handler_id: int = 0
 
     @staticmethod
     def _parse_env(sections: dict[str, list[str]]) -> _State:
@@ -136,7 +143,7 @@ class CursorPage(SectionPage):
             factory=factory,
             selected=self._index_for(self._current.theme),
         )
-        row.connect("notify::selected", self._on_theme_selected)
+        self._theme_handler_id = row.connect("notify::selected", self._on_theme_selected)
         self._theme_row = row
 
         self._size_adjustment = Gtk.Adjustment(
@@ -146,7 +153,7 @@ class CursorPage(SectionPage):
         self._size_spin.set_valign(Gtk.Align.CENTER)
         self._size_spin.set_sensitive(self._current.theme != _SYSTEM_DEFAULT)
         self._size_spin.set_tooltip_text("Cursor size (pixels)")
-        self._size_spin.connect("value-changed", self._on_size_changed)
+        self._size_handler_id = self._size_spin.connect("value-changed", self._on_size_changed)
         row.add_suffix(self._size_spin)
 
         self._field = ManagedRow(
@@ -225,15 +232,18 @@ class CursorPage(SectionPage):
     def _set_state_silent(self, value: tuple[str, int]) -> None:
         theme, size = value
         self._current = _State(theme, size)
-        self._suspend_undo = True
-        try:
-            if self._theme_row is not None:
+        if self._theme_row is not None:
+            self._theme_row.handler_block(self._theme_handler_id)
+            try:
                 self._theme_row.set_selected(self._index_for(theme))
-            if self._size_adjustment is not None:
+            finally:
+                self._theme_row.handler_unblock(self._theme_handler_id)
+        if self._size_spin is not None and self._size_adjustment is not None:
+            self._size_spin.handler_block(self._size_handler_id)
+            try:
                 self._size_adjustment.set_value(size)
-        finally:
-            self._suspend_undo = False
-        if self._size_spin is not None:
+            finally:
+                self._size_spin.handler_unblock(self._size_handler_id)
             self._size_spin.set_sensitive(theme != _SYSTEM_DEFAULT)
 
     # ── Callbacks ──
@@ -263,7 +273,7 @@ class CursorPage(SectionPage):
         self._changed()
 
     def _changed(self) -> None:
-        if self._push_undo and not self._suspend_undo:
+        if self._push_undo:
             self._push_undo(
                 CursorUndoEntry(
                     old_theme=self._last_pushed.theme,
@@ -312,6 +322,32 @@ class CursorPage(SectionPage):
 
     def discard(self) -> None:
         self.restore_snapshot(self._baseline.theme, self._baseline.size)
+
+    def iter_pending_changes(self) -> Iterator[PendingChange]:
+        if not self.is_dirty():
+            return
+        diffs: list[str] = []
+        if self._baseline.theme != self._current.theme:
+            diffs.append(
+                f"theme {self._theme_label(self._baseline.theme)} → "
+                f"{self._theme_label(self._current.theme)}"
+            )
+        if self._baseline.size != self._current.size:
+            diffs.append(f"size {self._baseline.size}px → {self._current.size}px")
+        yield PendingChange(
+            category="Cursor",
+            title="Cursor theme",
+            subtitle=" · ".join(diffs) if diffs else "updated",
+            kind="modified",
+            revert=self.discard,
+            navigate_to="cursor",
+            icon=CURSOR_ICON,
+        )
+
+    @staticmethod
+    def _theme_label(theme: str) -> str:
+        # Avoid leaking the internal sentinel into UI strings.
+        return "System default" if theme.startswith("__") else theme
 
     def restore_snapshot(self, theme: str, size: int) -> None:
         """Set state + UI to (theme, size) without pushing an undo entry."""

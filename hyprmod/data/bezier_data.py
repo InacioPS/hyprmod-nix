@@ -4,8 +4,7 @@ import functools
 import json
 from pathlib import Path
 
-from hyprland_config import atomic_write
-from hyprland_state import HYPRLAND_NATIVE_CURVES
+from hyprland_config import HYPRLAND_NATIVE_CURVES, BezierData, atomic_write
 
 from hyprmod.core.config import HYPRMOD_DIR
 from hyprmod.data.bezier_presets import BUILTIN_PRESETS
@@ -132,7 +131,7 @@ class BezierCurveStore:
                 continue
             pts = self.get_curve_points(name)
             if pts:
-                lines.append(f"bezier = {name}, {pts[0]}, {pts[1]}, {pts[2]}, {pts[3]}")
+                lines.append(BezierData(name=name, points=tuple(pts)).to_line())
         return lines
 
     def next_custom_name(self) -> str:

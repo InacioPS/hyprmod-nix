@@ -38,6 +38,7 @@ Huge thanks to the creators below — without you, HyprMod would reach far fewer
 
 ## ✨ Features
 
+- **Lua config support** — migrate and edit `hyprland.lua` directly (Hyprland 0.55+)
 - Bezier curve editor with live animation preview
 - Monitor layout editor with VRR, HDR, and 10-bit detection
 - Keybind editor with interactive key capture, including mouse-drag (`bindm`) binds
@@ -84,7 +85,7 @@ pipx install .
 hyprmod
 ```
 
-On first launch, HyprMod asks permission to add one `source` line to your `hyprland.conf` — that's the only time it touches your config.
+On first launch, HyprMod asks permission to add one include line to your top-level config — `source = …` in `hyprland.conf`, or `dofile("…")` in `hyprland.lua` if you're already on the Lua entrypoint. That's the only time it touches your config.
 
 ## 🗺️ Roadmap
 
@@ -93,7 +94,6 @@ On first launch, HyprMod asks permission to add one `source` line to your `hyprl
 - Translations (gettext)
 
 **Later**
-- Lua config support — once Hyprland's Lua API stabilizes
 - Pages for the hypr* ecosystem — hyprpaper, hypridle, hyprlock
 - Plugin manager (`hyprpm`)
 - Command-line interface — `hyprmod profile apply <name>`

@@ -57,36 +57,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-import hyprland_config
+from hyprland_config import LAYER_BOOL_EFFECTS, split_top_level
 
 from hyprmod.core import config
+from hyprmod.core.external import load_external_keyword_entries
 
 # Sequence of accepted keywords on read. Single-element tuple kept as a
 # tuple (not a bare string) so the external loader and any hypothetical
 # future versioned alias can extend without API churn at the call sites.
 LAYER_RULE_KEYWORDS: tuple[str, ...] = (config.KEYWORD_LAYERRULE,)
-KEYWORD_WRITE: str = config.KEYWORD_LAYERRULE
-
-
-# ---------------------------------------------------------------------------
-# Effect classifications
-# ---------------------------------------------------------------------------
-
-
-# Bool-typed effects: emit ``on`` if the user didn't specify a value.
-# Hyprland 0.54.3 rejects bare ``blur`` (etc.) with "missing a value",
-# so this set drives the same auto-fill ``effect_full`` does for
-# windowrule's :data:`V3_BOOL_EFFECTS`.
-LAYER_BOOL_EFFECTS: frozenset[str] = frozenset(
-    {
-        "no_anim",
-        "blur",
-        "blur_popups",
-        "dim_around",
-        "xray",
-        "no_screen_share",
-    }
-)
 
 
 # Map from legacy (pre-0.54) effect names to their v3 spelling.
@@ -101,12 +80,12 @@ _LEGACY_EFFECT_RENAMES: dict[str, tuple[str, str | None]] = {
     "dimaround": ("dim_around", None),
     "ignorealpha": ("ignore_alpha", None),
     "ignorezero": ("ignore_alpha", "0"),
-    # ``noshadow`` and ``unset`` aren't in the 0.54 effect list at all —
-    # there's nothing to migrate them *to*. We drop them silently
-    # (return ``None`` from the parser) rather than emit invalid
-    # config; users editing such a rule see it disappear from the UI,
-    # which matches what Hyprland would do on reload.
 }
+
+# Legacy names without a v3 equivalent. Dropped by ``_migrate_legacy_effect``
+# rather than emitted as invalid config; users editing such a rule see it
+# disappear from the UI, which matches what Hyprland would do on reload.
+_DROPPED_LEGACY_EFFECTS: frozenset[str] = frozenset({"unset", "noshadow"})
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +140,7 @@ class LayerRule:
 
     def to_line(self) -> str:
         """Serialize as the full ``layerrule = …`` config line."""
-        return f"{KEYWORD_WRITE} = {self.body()}"
+        return f"{config.KEYWORD_LAYERRULE} = {self.body()}"
 
 
 # ---------------------------------------------------------------------------
@@ -364,38 +343,6 @@ def lookup_preset(rule_name: str) -> LayerActionPreset:
 # ---------------------------------------------------------------------------
 
 
-def _split_top_level(s: str) -> list[str]:
-    """Split a layerrule body on top-level commas.
-
-    Top-level meaning: not inside parentheses (used by some matcher
-    regexes — e.g. ``^(waybar|notifications)$``). Square and curly
-    brackets are treated as parens too. Mirrors
-    :func:`hyprmod.core.window_rules._parse._split_top_level`.
-    """
-    result: list[str] = []
-    depth = 0
-    current: list[str] = []
-    for ch in s:
-        if ch in "([{":
-            depth += 1
-            current.append(ch)
-        elif ch in ")]}":
-            if depth > 0:
-                depth -= 1
-            current.append(ch)
-        elif ch == "," and depth == 0:
-            piece = "".join(current).strip()
-            if piece:
-                result.append(piece)
-            current = []
-        else:
-            current.append(ch)
-    tail = "".join(current).strip()
-    if tail:
-        result.append(tail)
-    return result
-
-
 def _parse_match_token(token: str) -> tuple[str, str] | None:
     """Parse a ``match:KEY VALUE`` token; return ``(key, value)`` or ``None``.
 
@@ -426,15 +373,12 @@ def _migrate_legacy_effect(name: str, args: str) -> tuple[str, str] | None:
 
     Returns ``(new_name, new_args)`` for known renames, the input
     unchanged for already-v3 names, or ``None`` for legacy names with
-    no v3 equivalent (``unset``, ``noshadow``) which the parser
-    should drop.
+    no v3 equivalent (``unset``, ``noshadow``) which the parser drops.
     """
     if name in _LEGACY_EFFECT_RENAMES:
         new_name, new_args = _LEGACY_EFFECT_RENAMES[name]
         return new_name, new_args if new_args is not None else args
-    if name in {"unset", "noshadow"}:
-        # Legacy rules with no v3 home — drop them. ``unset`` is no
-        # longer an effect type; ``noshadow`` was removed entirely.
+    if name in _DROPPED_LEGACY_EFFECTS:
         return None
     return name, args
 
@@ -463,7 +407,7 @@ def parse_layer_rule_line(line: str) -> LayerRule | None:
     head, sep, tail = line.partition("=")
     if not sep:
         return None
-    if head.strip() != KEYWORD_WRITE:
+    if head.strip() != config.KEYWORD_LAYERRULE:
         return None
     body = tail.strip()
     if not body:
@@ -481,7 +425,7 @@ def _parse_body_with_split(body: str) -> list[LayerRule]:
     effects without merging them into a single rule (which would lose
     information when the user edits one).
     """
-    tokens = _split_top_level(body)
+    tokens = split_top_level(body)
     if not tokens:
         return []
 
@@ -523,7 +467,7 @@ def _parse_body_with_split(body: str) -> list[LayerRule]:
             looks_like_effect = (
                 name in _LEGACY_EFFECT_RENAMES
                 or name in LAYER_ACTION_PRESETS_BY_ID
-                or name in {"unset", "noshadow"}
+                or name in _DROPPED_LEGACY_EFFECTS
             )
             if not looks_like_effect:
                 legacy_namespace_candidates.append(name)
@@ -557,7 +501,7 @@ def parse_layer_rule_lines(lines: list[str]) -> list[LayerRule]:
     result: list[LayerRule] = []
     for raw in lines:
         head, sep, tail = raw.partition("=")
-        if not sep or head.strip() != KEYWORD_WRITE:
+        if not sep or head.strip() != config.KEYWORD_LAYERRULE:
             continue
         body = tail.strip()
         if not body:
@@ -630,40 +574,34 @@ def load_external_layer_rules(
     the parser auto-migrates legacy effect names so users see a
     consistent view regardless of which syntax their config uses.
     """
-    if not root_path.exists():
-        return []
-    try:
-        doc = hyprland_config.load(root_path, follow_sources=True, lenient=True)
-    except (OSError, hyprland_config.ParseError, hyprland_config.SourceCycleError):
-        return []
-
-    managed_str = str(managed_path)
+    # Layer-rule parsing handles legacy aliases itself, so unlike window rules
+    # this path does not require a document-wide migration pass.
+    entries = load_external_keyword_entries(
+        root_path,
+        managed_path,
+        LAYER_RULE_KEYWORDS,
+    )
     external: list[ExternalLayerRule] = []
-    for keyword in LAYER_RULE_KEYWORDS:
-        for entry in doc.find_all(keyword):
-            if entry.source_name == managed_str:
-                continue
-            line = f"{entry.key} = {entry.value}"
-            # Multi-effect lines split into multiple rules, each carried
-            # separately so the UI can show every effect with its source
-            # location.
-            for rule in parse_layer_rule_lines([line]):
-                external.append(
-                    ExternalLayerRule(
-                        rule=rule,
-                        source_path=Path(entry.source_name),
-                        lineno=entry.lineno,
-                    )
+    for entry in entries:
+        line = f"{entry.key} = {entry.value}"
+        # Multi-effect lines split into multiple rules, each carried
+        # separately so the UI can show every effect with its source
+        # location.
+        for rule in parse_layer_rule_lines([line]):
+            external.append(
+                ExternalLayerRule(
+                    rule=rule,
+                    source_path=entry.source_path,
+                    lineno=entry.lineno,
                 )
+            )
     return external
 
 
 __all__ = [
     "CUSTOM_PRESET",
-    "KEYWORD_WRITE",
     "LAYER_ACTION_PRESETS",
     "LAYER_ACTION_PRESETS_BY_ID",
-    "LAYER_BOOL_EFFECTS",
     "LAYER_RULE_KEYWORDS",
     "ExternalLayerRule",
     "LayerActionField",

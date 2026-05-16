@@ -1,6 +1,7 @@
 """Monitor management page — orchestrates cards, preview, and Hyprland IPC."""
 
 import copy
+from collections.abc import Iterator
 
 from gi.repository import Adw, GLib, Gtk
 from hyprland_monitors import get_monitor_capabilities
@@ -21,12 +22,14 @@ from hyprland_socket import HyprlandError
 
 from hyprmod.core import config
 from hyprmod.core.ownership import OwnershipSet
+from hyprmod.core.pending import PendingChange
 from hyprmod.core.undo import MonitorsUndoEntry
 from hyprmod.pages.monitors.card import MonitorCard
 from hyprmod.pages.monitors.confirm_controller import ConfirmController
 from hyprmod.pages.section import SectionPage
 from hyprmod.ui import clear_children, make_page_layout, try_with_toast
 from hyprmod.ui.empty_state import EmptyState
+from hyprmod.ui.icons import MONITORS_ICON
 from hyprmod.ui.monitor_preview import MonitorLayoutPreview
 from hyprmod.ui.timer import Timer
 
@@ -138,11 +141,8 @@ class MonitorsPage(SectionPage):
         """Fetch monitors from IPC, snap scales, and merge saved config."""
         self._monitors = sorted(self._window.hypr.monitors.get_all() or [], key=lambda m: m.name)
         self._snap_scales()
-        if saved_sections is not None:
-            saved = config.collect_section(saved_sections, config.KEYWORD_MONITOR)
-        else:
-            _, sections = config.read_all_sections()
-            saved = config.collect_section(sections, config.KEYWORD_MONITOR)
+        sections = saved_sections if saved_sections is not None else self._window.saved_sections
+        saved = config.collect_section(sections, config.KEYWORD_MONITOR)
         if saved:
             merge_saved_state(self._monitors, saved)
         self._ownership = OwnershipSet(self._managed_names_from_lines(saved))
@@ -445,7 +445,7 @@ class MonitorsPage(SectionPage):
         doc = self._window.hypr.document
         if doc is None:
             return
-        excluded = frozenset({config.gui_conf().resolve()})
+        excluded = frozenset({config.managed_path().resolve()})
         user_lines = doc.find_all(config.KEYWORD_MONITOR, exclude_sources=excluded)
         # Find the last matching line (Hyprland semantics).
         # A line refers to ``mon`` if its leading token resolves to it — handles
@@ -600,6 +600,69 @@ class MonitorsPage(SectionPage):
         managed = [m for m in self._monitors if self._ownership.is_owned(m.name)]
         saved = [m for m in self._saved_monitors if self._ownership.is_saved(m.name)]
         return sorted(lines_from_monitors(managed)) != sorted(lines_from_monitors(saved))
+
+    def iter_pending_changes(self) -> Iterator[PendingChange]:
+        if not self.is_dirty():
+            return
+        saved_by_name = {m.name: m for m in self._saved_monitors}
+        for mon in self._monitors:
+            is_owned = self._ownership.is_owned(mon.name)
+            was_saved = self._ownership.is_saved(mon.name)
+            baseline = saved_by_name.get(mon.name)
+            if is_owned and not was_saved:
+                kind, subtitle = "added", self._summarize_monitor(mon)
+            elif was_saved and not is_owned:
+                kind, subtitle = "removed", "remove from managed config"
+            elif (
+                is_owned
+                and baseline is not None
+                and lines_from_monitors([mon]) != lines_from_monitors([baseline])
+            ):
+                kind, subtitle = "modified", self._diff_monitor(baseline, mon)
+            else:
+                continue
+            yield PendingChange(
+                category="Monitors",
+                title=self._monitor_label(mon),
+                subtitle=subtitle,
+                kind=kind,
+                revert=lambda m=mon: self._discard_monitor(m),
+                navigate_to="monitors",
+                icon=MONITORS_ICON,
+            )
+
+    @staticmethod
+    def _monitor_label(mon: MonitorState) -> str:
+        desc = f"{mon.make} {mon.model}".strip()
+        return f"{mon.name} — {desc}" if desc else mon.name
+
+    @staticmethod
+    def _summarize_monitor(mon: MonitorState) -> str:
+        if mon.disabled:
+            return "disabled"
+        return (
+            f"{mon.width}x{mon.height}@{mon.refresh_rate:.0f}Hz · "
+            f"{mon.x},{mon.y} · scale {mon.scale:g}"
+        )
+
+    @staticmethod
+    def _diff_monitor(baseline: MonitorState, current: MonitorState) -> str:
+        diffs: list[str] = []
+        if baseline.disabled != current.disabled:
+            diffs.append("disabled" if current.disabled else "re-enabled")
+        if (baseline.width, baseline.height) != (current.width, current.height):
+            diffs.append(f"{baseline.width}x{baseline.height} → {current.width}x{current.height}")
+        if abs(baseline.refresh_rate - current.refresh_rate) > 0.01:
+            diffs.append(f"{baseline.refresh_rate:.0f}Hz → {current.refresh_rate:.0f}Hz")
+        if (baseline.x, baseline.y) != (current.x, current.y):
+            diffs.append(f"pos {baseline.x},{baseline.y} → {current.x},{current.y}")
+        if abs(baseline.scale - current.scale) > 1e-6:
+            diffs.append(f"scale {baseline.scale:g} → {current.scale:g}")
+        if baseline.transform != current.transform:
+            diffs.append(f"rotate {baseline.transform} → {current.transform}")
+        if (baseline.mirror_of or "") != (current.mirror_of or ""):
+            diffs.append(f"mirror {baseline.mirror_of or '—'} → {current.mirror_of or '—'}")
+        return " · ".join(diffs) if diffs else "updated"
 
     def dirty_count(self) -> int:
         """Count individual monitors with unsaved changes."""

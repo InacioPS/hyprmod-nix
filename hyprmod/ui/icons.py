@@ -6,9 +6,11 @@ strings in one place means a future icon swap touches one line, not
 every list that mirrors the sidebar.
 """
 
-# Fixed (non-schema) sidebar pages. The schema-driven groups
-# (general/decoration/animations/etc.) get their icons from the schema
-# itself and are looked up dynamically by id.
+# Fixed (non-schema) sidebar pages. Pages whose group lives in the
+# schema (general/decoration/etc.) read their icons from there at
+# runtime; ``ANIMATIONS_ICON`` / ``CURSOR_ICON`` mirror the schema for
+# section pages that want to surface their icon outside the sidebar
+# (notably the pending-changes rows).
 BINDS_ICON = "keyboard-shortcuts-symbolic"
 MONITORS_ICON = "display-symbolic"
 AUTOSTART_ICON = "media-playback-start-symbolic"
@@ -16,6 +18,8 @@ ENV_VARS_ICON = "utilities-terminal-symbolic"
 WINDOW_RULES_ICON = "window-rules-symbolic"
 LAYER_RULES_ICON = "overlapping-windows-symbolic"
 LAYOUTS_ICON = "view-grid-symbolic"
+ANIMATIONS_ICON = "bounce-symbolic"
+CURSOR_ICON = "hyprmod-cursor-symbolic"
 
 PENDING_ICON = "view-list-symbolic"
 PROFILES_ICON = "user-bookmarks-symbolic"

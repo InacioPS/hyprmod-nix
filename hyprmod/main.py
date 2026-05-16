@@ -6,16 +6,17 @@ from pathlib import Path
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
-from hyprmod.core import config
+from hyprmod.constants import APPLICATION_ID
 from hyprmod.core.setup import needs_setup, run_setup
-from hyprmod.ui import display_path
+from hyprmod.ui import try_with_toast
+from hyprmod.ui.onboarding_dialog import OnboardingDialog
 from hyprmod.window import HyprModWindow
 
 
 class HyprModApp(Adw.Application):
     def __init__(self):
         super().__init__(
-            application_id="io.github.bluemancz.hyprmod",
+            application_id=APPLICATION_ID,
             flags=Gio.ApplicationFlags.DEFAULT_FLAGS,
         )
 
@@ -30,117 +31,18 @@ class HyprModApp(Adw.Application):
 
     def do_activate(self):
         win = self.props.active_window
-        if not win:
+        if not isinstance(win, HyprModWindow):
             win = HyprModWindow(application=self)
 
-        # First-run setup check
         if needs_setup():
-            self._show_onboarding(win)
+            window = win  # locally typed for the closure below
+
+            def _on_setup() -> None:
+                try_with_toast(window.show_toast, "Setup failed", run_setup)
+
+            OnboardingDialog(on_setup=_on_setup).present(win)
 
         win.present()
-
-    def _show_onboarding(self, win):
-        dialog = Adw.AlertDialog(heading="Welcome to HyprMod")
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
-        box.set_margin_top(8)
-        box.set_margin_bottom(8)
-        box.set_margin_start(8)
-        box.set_margin_end(8)
-
-        intro = Gtk.Label(
-            label="HyprMod gives you a visual interface for all Hyprland settings "
-            "with live preview. Every change is applied instantly to your "
-            "running compositor.",
-        )
-        intro.set_wrap(True)
-        intro.set_xalign(0)
-        box.append(intro)
-
-        # Feature highlights
-        features = [
-            (
-                "view-refresh-symbolic",
-                "Live Preview",
-                "Changes apply instantly via hyprctl "
-                "\u2014 see the effect on your desktop in real time",
-            ),
-            (
-                "security-high-symbolic",
-                "Safe Config",
-                "Your hyprland.conf is never modified. HyprMod manages its own file",
-            ),
-            (
-                "input-keyboard-symbolic",
-                "Keyboard Shortcuts",
-                "Ctrl+S to save, Ctrl+F to search, Ctrl+Z to undo",
-            ),
-        ]
-
-        for icon, title, desc in features:
-            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-            img = Gtk.Image.new_from_icon_name(icon)
-            img.set_pixel_size(24)
-            img.set_valign(Gtk.Align.START)
-            row.append(img)
-
-            text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-            title_label = Gtk.Label(label=title)
-            title_label.set_xalign(0)
-            title_label.add_css_class("heading")
-            text_box.append(title_label)
-
-            desc_label = Gtk.Label(label=desc)
-            desc_label.set_xalign(0)
-            desc_label.set_wrap(True)
-            desc_label.add_css_class("dim-label")
-            text_box.append(desc_label)
-
-            row.append(text_box)
-            box.append(row)
-
-        setup_text = Gtk.Label(
-            label="To get started, HyprMod needs to add one line to your hyprland.conf:",
-        )
-        setup_text.set_wrap(True)
-        setup_text.set_xalign(0)
-        setup_text.add_css_class("dim-label")
-        box.append(setup_text)
-
-        code_box = Gtk.Box()
-        code_box.add_css_class("code-block")
-        code_view = Gtk.TextView()
-        code_view.set_editable(False)
-        code_view.set_cursor_visible(False)
-        code_view.set_monospace(True)
-        code_view.set_wrap_mode(Gtk.WrapMode.NONE)
-        code_view.set_top_margin(10)
-        code_view.set_bottom_margin(10)
-        code_view.set_left_margin(14)
-        code_view.set_right_margin(14)
-        code_view.set_hexpand(True)
-        code_view.set_size_request(420, -1)
-        # Render the source line against the *live* configured path so a
-        # user who pre-set ``hyprmod.config-path`` to a custom location
-        # sees that location in the onboarding instead of a stale default.
-        code_view.get_buffer().set_text(f"source = {display_path(config.gui_conf())}")
-        code_view.add_css_class("code-block-text")
-        code_box.append(code_view)
-        box.append(code_box)
-
-        dialog.set_extra_child(box)
-
-        dialog.add_response("cancel", "Not Now")
-        dialog.add_response("setup", "Get Started")
-        dialog.set_response_appearance("setup", Adw.ResponseAppearance.SUGGESTED)
-        dialog.set_default_response("setup")
-        dialog.set_close_response("cancel")
-
-        def on_response(dialog_, response):
-            if response == "setup":
-                run_setup()
-
-        dialog.connect("response", on_response)
-        dialog.present(win)
 
 
 def main():

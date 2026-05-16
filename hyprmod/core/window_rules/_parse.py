@@ -25,8 +25,10 @@ skipped migration) returns ``None`` from the parser rather than being
 silently miscompiled.
 """
 
+from hyprland_config import split_top_level
+
+from hyprmod.core import config
 from hyprmod.core.window_rules._model import (
-    KEYWORD_WRITE,
     Matcher,
     WindowRule,
 )
@@ -50,38 +52,6 @@ def _parse_match_token(token: str) -> Matcher | None:
     return Matcher(key=key.strip(), value=value.strip())
 
 
-def _split_top_level(s: str) -> list[str]:
-    """Split a windowrule body on top-level commas.
-
-    Top-level meaning: not inside parentheses (used by ``move`` /
-    ``size`` expressions like ``cursor_x-(window_w*0.5)``). Square and
-    curly brackets are treated as parens too — they're rare in matcher
-    values, but the same logic applies.
-    """
-    result: list[str] = []
-    depth = 0
-    current: list[str] = []
-    for ch in s:
-        if ch in "([{":
-            depth += 1
-            current.append(ch)
-        elif ch in ")]}":
-            if depth > 0:
-                depth -= 1
-            current.append(ch)
-        elif ch == "," and depth == 0:
-            piece = "".join(current).strip()
-            if piece:
-                result.append(piece)
-            current = []
-        else:
-            current.append(ch)
-    tail = "".join(current).strip()
-    if tail:
-        result.append(tail)
-    return result
-
-
 def parse_window_rule_line(line: str) -> WindowRule | None:
     """Parse a single ``windowrule = …`` line into a :class:`WindowRule`.
 
@@ -97,7 +67,7 @@ def parse_window_rule_line(line: str) -> WindowRule | None:
     head, sep, tail = line.partition("=")
     if not sep:
         return None
-    if head.strip() != KEYWORD_WRITE:
+    if head.strip() != config.KEYWORD_WINDOWRULE:
         return None
     body = tail.strip()
     if not body:
@@ -107,7 +77,7 @@ def parse_window_rule_line(line: str) -> WindowRule | None:
 
 def _parse_v3_body(body: str) -> WindowRule | None:
     """Parse the body of a v3 ``windowrule = …`` line."""
-    tokens = _split_top_level(body)
+    tokens = split_top_level(body)
     if not tokens:
         return None
 
@@ -162,13 +132,13 @@ def _parse_with_effect_split(line: str) -> list[WindowRule]:
     head, sep, tail = line.partition("=")
     if not sep:
         return []
-    if head.strip() != KEYWORD_WRITE:
+    if head.strip() != config.KEYWORD_WINDOWRULE:
         return []
     body = tail.strip()
     if not body:
         return []
 
-    tokens = _split_top_level(body)
+    tokens = split_top_level(body)
     matchers: list[Matcher] = []
     effects: list[tuple[str, str]] = []
     for tok in tokens:

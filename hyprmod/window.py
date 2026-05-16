@@ -2,6 +2,7 @@
 
 import subprocess
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
@@ -9,17 +10,10 @@ from hyprland_config import coerce_config_value
 from hyprland_socket import HyprlandError
 from hyprland_state import ANIM_LOOKUP, HyprlandState
 
+from hyprmod.constants import APPLICATION_ID
 from hyprmod.core import config, profiles, schema
 from hyprmod.core.state import AppState
-from hyprmod.core.undo import (
-    AnimationUndoEntry,
-    BindsUndoEntry,
-    CursorUndoEntry,
-    MonitorsUndoEntry,
-    OptionChange,
-    SavedListSnapshot,
-    UndoManager,
-)
+from hyprmod.core.undo import OptionChange, UndoManager
 from hyprmod.data.bezier_data import get_curve_store
 from hyprmod.pages.animations import AnimationsPage
 from hyprmod.pages.autostart import AutostartPage
@@ -37,6 +31,8 @@ from hyprmod.pages.window_rules import WindowRulesPage
 from hyprmod.ui import OptionRow, clear_children, confirm, create_option_row, make_page_layout
 from hyprmod.ui.about import build_about_dialog
 from hyprmod.ui.banner import DirtyBanner
+from hyprmod.ui.lua_migration_controller import ACTION_NAME as LUA_MIGRATION_ACTION
+from hyprmod.ui.lua_migration_controller import LuaMigrationController
 from hyprmod.ui.options import digits_for_step
 from hyprmod.ui.pending_chip import PendingChipGroup
 from hyprmod.ui.search import MIN_QUERY_LENGTH, SearchPage
@@ -51,8 +47,9 @@ INPUT_TOUCHPAD = "input:touchpad"
 
 CSS_PATH = Path(__file__).parent / "style.css"
 GSETTINGS_DIR = Path(__file__).parent / "data"
-SETTINGS_SCHEMA_ID = "io.github.bluemancz.hyprmod"
-LEGACY_SETTINGS_SCHEMA_ID = "com.github.hyprmod"
+# The GSettings schema id matches our application id by convention; aliasing
+# here keeps the schema lookup explicit at point of use.
+SETTINGS_SCHEMA_ID = APPLICATION_ID
 
 
 class HyprModWindow(Adw.ApplicationWindow):
@@ -65,7 +62,9 @@ class HyprModWindow(Adw.ApplicationWindow):
         self._init_settings()
         self._apply_saved_config_path()
 
-        self._saved_values, self._saved_sections = config.read_all_sections()
+        # Warm the managed-config cache so the first ``saved_sections`` access
+        # below doesn't pay for a parse synchronously during widget construction.
+        config.read_cached()
         self.hypr = HyprlandState()
         self._hyprland_available = self.hypr.online
         if self._hyprland_available:
@@ -77,6 +76,10 @@ class HyprModWindow(Adw.ApplicationWindow):
         self._schema = schema.load_schema(version=self.hypr.version)
         self.app_state = AppState(self.hypr)
         self._option_rows: dict[str, OptionRow] = {}
+        # Track the PreferencesGroup that owns each option row so we can hide
+        # whole groups that turn out empty on the running Hyprland version
+        # (e.g. all rows in a "Frame rate" group are options removed in 0.55).
+        self._row_owner_group: dict[str, Adw.PreferencesGroup] = {}
         self._dependents: dict[str, list[str]] = {}  # parent_key -> [dependent_keys]
         self._options_flat: dict[str, dict] = schema.get_options_flat(self._schema)
         self._key_to_group: dict[str, str] = {}  # option key -> sidebar group_id
@@ -119,49 +122,8 @@ class HyprModWindow(Adw.ApplicationWindow):
         schema_obj = schema_source.lookup(SETTINGS_SCHEMA_ID, False)
         if schema_obj:
             self._settings = Gio.Settings.new_full(schema_obj, None, None)
-            self._migrate_legacy_settings(schema_source, schema_obj)
         else:
             self._settings = None
-
-    def _migrate_legacy_settings(
-        self,
-        schema_source: Gio.SettingsSchemaSource,
-        schema: Gio.SettingsSchema,
-    ):
-        """Copy user values from the legacy ``com.github.hyprmod`` schema.
-
-        The schema id was renamed in c208927, which also moved the dconf
-        path. Without this migration, users upgrading from older versions
-        would silently lose their ``auto-save`` / ``config-path``
-        preferences. Migrated keys are reset on the old path so this runs
-        at most once per user.
-
-        TODO: remove this method (and ``LEGACY_SETTINGS_SCHEMA_ID`` plus
-        ``hyprmod/data/com.github.hyprmod.gschema.xml``) after a few
-        releases — target ~6 months post-rename, or v0.3+. Users who
-        haven't upgraded by then can reconfigure their two preferences
-        manually.
-        """
-        if self._settings is None:
-            return
-        legacy_schema = schema_source.lookup(LEGACY_SETTINGS_SCHEMA_ID, False)
-        if legacy_schema is None:
-            return
-        legacy = Gio.Settings.new_full(legacy_schema, None, None)
-        shared_keys = set(legacy_schema.list_keys()) & set(schema.list_keys())
-        for key in shared_keys:
-            old_value = legacy.get_user_value(key)
-            if old_value is None:
-                continue
-            # Respect any value the user already set under the new schema.
-            if self._settings.get_user_value(key) is None:
-                try:
-                    self._settings.set_value(key, old_value)
-                except (GLib.Error, TypeError):
-                    # Type changed between schemas — skip without resetting
-                    # so a future migration attempt can try again.
-                    continue
-            legacy.reset(key)
 
     @staticmethod
     def _recompile_schemas_if_stale():
@@ -182,7 +144,7 @@ class HyprModWindow(Adw.ApplicationWindow):
         if self._settings:
             path = self._settings.get_string("config-path")
             if path:
-                config.set_gui_conf(Path(path))
+                config.set_managed_path(Path(path))
 
     @property
     def auto_save(self) -> bool:
@@ -196,14 +158,49 @@ class HyprModWindow(Adw.ApplicationWindow):
             self._settings.set_boolean("auto-save", value)
 
     @property
+    def saved_sections(self) -> dict[str, list[str]]:
+        """The keyword sections parsed from the managed config on disk.
+
+        Delegates to :func:`config.read_cached` so pages and the save flow
+        share one parse instead of re-reading per call. The cache is
+        invalidated whenever hyprmod writes the managed file, so reads
+        always reflect on-disk state without explicit refresh.
+        """
+        return config.read_cached()[1]
+
+    @property
+    def saved_values(self) -> dict[str, str]:
+        """The option ``key = value`` assignments parsed from the managed config."""
+        return config.read_cached()[0]
+
+    @property
+    def option_rows(self) -> dict[str, OptionRow]:
+        """Read-only view of option-key → row mapping for cross-page navigation."""
+        return self._option_rows
+
+    @property
+    def section_pages(self) -> list[SectionPage]:
+        """The section pages whose dirty/save/discard the window orchestrates."""
+        return self._section_pages
+
+    @property
+    def options_flat(self) -> dict[str, dict]:
+        """Flattened option catalog keyed by dotted option name."""
+        return self._options_flat
+
+    def group_for_option(self, key: str) -> str | None:
+        """Return the sidebar group id that contains *key* (or ``None``)."""
+        return self._key_to_group.get(key)
+
+    @property
     def config_path(self) -> str:
-        return str(config.gui_conf())
+        return str(config.managed_path())
 
     @config_path.setter
     def config_path(self, value: str):
-        default = str(config.default_gui_conf())
+        default = str(config.default_managed_path())
         path = None if value == default else Path(value)
-        config.set_gui_conf(path)
+        config.set_managed_path(path)
         if self._settings:
             self._settings.set_string("config-path", "" if path is None else value)
 
@@ -240,6 +237,15 @@ class HyprModWindow(Adw.ApplicationWindow):
         about_action.connect("activate", self._on_show_about)
         self.add_action(about_action)
 
+        # Lua migration: owns its banner, action, dialog, completion flow.
+        self._lua_migration = LuaMigrationController(
+            self,
+            self._settings,
+            show_toast=self.show_toast,
+            get_hyprland_version=lambda: self.hypr.version,
+        )
+        self._lua_migration.install_action(self)
+
         # Hyprland status banner
         self._hyprland_banner = Adw.Banner(
             title="Hyprland not detected — changes will be saved to config files "
@@ -247,6 +253,12 @@ class HyprModWindow(Adw.ApplicationWindow):
         )
         self._hyprland_banner.set_revealed(not self._hyprland_available)
         self._main_box.append(self._hyprland_banner)
+
+        # Lua-migration offer — shown when the running Hyprland is 0.55+
+        # but the user still has a hyprland.conf entrypoint. Custom widget
+        # rather than Adw.Banner because we need two actions (migrate +
+        # don't-show-again), and Adw.Banner only allows one button.
+        self._main_box.append(self._lua_migration.banner)
 
         # Navigation split view
         self._split_view = Adw.NavigationSplitView()
@@ -358,7 +370,7 @@ class HyprModWindow(Adw.ApplicationWindow):
                 self,
                 on_dirty_changed=self._on_section_dirty,
                 push_undo=self._undo.push,
-                saved_sections=self._saved_sections,
+                saved_sections=self.saved_sections,
             )
             setattr(self, attr, page)
             self._page_stack.add_named(page.build(header=self._make_page_header(title)), slug)
@@ -418,6 +430,10 @@ class HyprModWindow(Adw.ApplicationWindow):
         prefs_section.append("Auto-save", "win.auto-save")
         menu.append_section(None, prefs_section)
 
+        tools_section = Gio.Menu()
+        tools_section.append("Migrate to Lua…", f"win.{LUA_MIGRATION_ACTION}")
+        menu.append_section(None, tools_section)
+
         help_section = Gio.Menu()
         help_section.append("Keyboard Shortcuts", "win.show-help-overlay")
         help_section.append("About HyprMod", "win.show-about")
@@ -447,7 +463,7 @@ class HyprModWindow(Adw.ApplicationWindow):
                 self,
                 on_dirty_changed=self._on_section_dirty,
                 push_undo=self._undo.push,
-                saved_sections=self._saved_sections,
+                saved_sections=self.saved_sections,
             )
             content_box.append(self._animations_page.build_curve_editor_widget())
 
@@ -456,7 +472,7 @@ class HyprModWindow(Adw.ApplicationWindow):
                 self,
                 on_dirty_changed=self._on_section_dirty,
                 push_undo=self._undo.push,
-                saved_sections=self._saved_sections,
+                saved_sections=self.saved_sections,
             )
             content_box.append(self._cursor_page.build_widget())
 
@@ -496,10 +512,11 @@ class HyprModWindow(Adw.ApplicationWindow):
                     value,
                     on_change=self._on_option_changed,
                     on_reset=self._on_option_reset,
-                    on_discard=self._on_option_discard,
+                    on_discard=self.discard_option,
                 )
                 if opt_row:
                     self._option_rows[option["key"]] = opt_row
+                    self._row_owner_group[option["key"]] = pref_group
                     pref_group.add(opt_row.row)
                     parent = option.get("depends_on")
                     if parent:
@@ -521,8 +538,9 @@ class HyprModWindow(Adw.ApplicationWindow):
 
     def _register_state(self):
         options_flat = self._options_flat
+        saved_values = self.saved_values
         for key, option in options_flat.items():
-            saved = self._saved_values.get(key)
+            saved = saved_values.get(key)
             if saved is not None:
                 saved = coerce_config_value(saved, option.get("type", ""))
             # Compute display digits for float options so AppState can
@@ -532,14 +550,28 @@ class HyprModWindow(Adw.ApplicationWindow):
                 digits = digits_for_step(option.get("step", 0.01))
             self.app_state.register(key, option.get("default"), saved, digits=digits)
 
-        # Disable rows for options not recognized by the running Hyprland
+        # Hide rows for options the running Hyprland doesn't recognise —
+        # both removed-in-this-version options and not-yet-introduced ones.
+        # We used to grey them out with a "not available" tooltip, but a
+        # disabled row is noisier than just dropping it: cross-version
+        # support is built from version-paired entries in ``options.json``
+        # (e.g. ``misc:vfr`` and ``debug:vfr`` both labelled "Variable
+        # frame rate") and only the right one for this Hyprland should
+        # render.
+        groups_with_visible: set[Adw.PreferencesGroup] = set()
         for key, opt_row in self._option_rows.items():
             state = self.app_state.get(key)
+            owner = self._row_owner_group.get(key)
             if state and not state.available:
-                opt_row.row.set_sensitive(False)
-                opt_row.row.set_tooltip_text(
-                    f"Option '{key}' is not available in this Hyprland version"
-                )
+                opt_row.row.set_visible(False)
+            elif owner is not None:
+                groups_with_visible.add(owner)
+        # A group whose every row was hidden becomes a stray title with no
+        # content. Hide the whole group so the page doesn't show an empty
+        # "Frame rate" / "Glow" / ... section header.
+        for group in set(self._row_owner_group.values()):
+            if group not in groups_with_visible:
+                group.set_visible(False)
 
         # Push AppState's authoritative values to widgets (AppState normalizes
         # floats and hex strings, so the widget must show the same value).
@@ -861,14 +893,14 @@ class HyprModWindow(Adw.ApplicationWindow):
         if key not in self._option_rows:
             return
 
-        fallback = self.hypr.get_fallback_value(key, config.gui_conf())
+        fallback = self.hypr.get_fallback_value(key, config.managed_path())
         self.app_state.reset_to_value(key, fallback)
         self._sync_option_row(key, flash=True)
         self._notify_ui_change()
         if self.auto_save:
             self._schedule_auto_save()
 
-    def _on_option_discard(self, key: str):
+    def discard_option(self, key: str):
         """Discard changes on a single option — revert to saved state."""
         state = self.app_state.get(key)
         if state and state.is_dirty:
@@ -928,111 +960,52 @@ class HyprModWindow(Adw.ApplicationWindow):
     def _on_redo(self, *_args):
         self._apply_undo_redo(undo=False)
 
-    # -- Undo/redo dispatch table --
-    #
-    # Maps an undo-entry class to ``(page_attr, apply)``: ``page_attr``
-    # is the ``HyprModWindow`` attribute holding the page that owns the
-    # entry's state, and ``apply(page, entry, undo)`` replays the entry
-    # on the page in the requested direction. ``OptionChange`` and
-    # ``SavedListSnapshot`` both have their own branches in
-    # :meth:`_apply_undo_redo`: ``OptionChange`` because it can fail
-    # mid-flight (HyprlandError) and ``SavedListSnapshot`` because the
-    # page lookup comes from the entry itself.
-    _UNDO_DISPATCH = {
-        AnimationUndoEntry: (
-            "_animations_page",
-            lambda page, e, undo: page.restore_state(
-                e.anim_name, e.anim_old if undo else e.anim_new
-            ),
-        ),
-        BindsUndoEntry: (
-            "_binds_page",
-            lambda page, e, undo: page.restore_snapshot(
-                e.old_items if undo else e.new_items,
-                e.old_baselines if undo else e.new_baselines,
-                e.old_session_overrides if undo else e.new_session_overrides,
-            ),
-        ),
-        MonitorsUndoEntry: (
-            "_monitors_page",
-            lambda page, e, undo: page.restore_snapshot(
-                e.old_monitors if undo else e.new_monitors,
-                e.old_owned if undo else e.new_owned,
-            ),
-        ),
-        CursorUndoEntry: (
-            "_cursor_page",
-            lambda page, e, undo: page.restore_snapshot(
-                e.old_theme if undo else e.new_theme,
-                e.old_size if undo else e.new_size,
-            ),
-        ),
-    }
-
     def _apply_undo_redo(self, undo: bool):
         entry = self._undo.pop_undo() if undo else self._undo.pop_redo()
         if entry is None:
             return
-        confirm = self._undo.confirm_undo if undo else self._undo.confirm_redo
-
-        if isinstance(entry, OptionChange):
-            value = entry.old_value if undo else entry.new_value
-            managed = entry.old_managed if undo else entry.new_managed
-            try:
-                success = self.app_state.apply_option_value(entry.key, value, managed)
-            except HyprlandError as e:
-                self.show_toast(f"Failed to set {entry.key} — {e}", timeout=5)
-                return
-            if success:
-                confirm(entry)
-                opt_row = self._option_rows.get(entry.key)
-                if opt_row:
-                    opt_row.set_value_silent(value)
-            return
-
-        if isinstance(entry, SavedListSnapshot):
-            page = getattr(self, entry.page_attr, None)
-            if page is None:
-                return
-            page.restore_snapshot(
-                entry.old_items if undo else entry.new_items,
-                entry.old_baselines if undo else entry.new_baselines,
-            )
-            confirm(entry)
-            return
-
-        dispatch = self._UNDO_DISPATCH.get(type(entry))
-        if dispatch is None:
-            return
-        page_attr, apply = dispatch
-        page = getattr(self, page_attr)
-        if page is None:
-            return
-        apply(page, entry, undo)
-        confirm(entry)
+        if entry.apply(self, undo=undo):
+            (self._undo.confirm_undo if undo else self._undo.confirm_redo)(entry)
 
     # -- Save with animation --
 
-    def _collect_save_sections(self) -> config.ConfigSections:
+    def collect_save_sections(self) -> config.ConfigSections:
         """Collect sections to save: dirty sections + previously saved sections.
 
         A section is only included if it was already in hyprmod's managed
         config (HyprMod owns it) or the user changed it in this session.
-        Parses the config file once to check all sections.
+        Reads through :func:`config.read_cached` — the on-disk file is
+        unchanged between the last invalidation and the user clicking Save.
         """
-        _, saved_sections = config.read_all_sections()
+        saved_sections = self.saved_sections
         sections = config.ConfigSections()
 
-        if self._binds_page is not None:
-            has_saved = config.collect_bind_section(saved_sections)
-            if has_saved or self._binds_page.is_dirty():
-                sections.binds = self._binds_page.get_bind_lines()
+        def emit_if[T: SectionPage](
+            page: T | None,
+            has_managed: Callable[[T], bool],
+            get_lines: Callable[[T], list[str]],
+        ) -> list[str] | None:
+            """Return ``page.get_lines()`` when the section is owned or dirty."""
+            if page is None:
+                return None
+            if has_managed(page) or page.is_dirty():
+                return get_lines(page)
+            return None
 
-        if self._monitors_page is not None:
-            saved_monitors = config.collect_section(saved_sections, config.KEYWORD_MONITOR)
-            if saved_monitors or self._monitors_page.is_dirty():
-                sections.monitors = self._monitors_page.get_monitor_lines()
+        sections.binds = emit_if(
+            self._binds_page,
+            lambda _p: bool(config.collect_bind_section(saved_sections)),
+            lambda p: p.get_bind_lines(),
+        )
+        sections.monitors = emit_if(
+            self._monitors_page,
+            lambda _p: bool(config.collect_section(saved_sections, config.KEYWORD_MONITOR)),
+            lambda p: p.get_monitor_lines(),
+        )
 
+        # Animations: bezier extraction is bespoke (curves used by emitted
+        # animations need their definitions emitted alongside), so this one
+        # stays inline.
         if self._animations_page is not None:
             anim_dirty = self._animations_page.is_dirty()
             existing_anims = config.collect_section(saved_sections, config.KEYWORD_ANIMATION)
@@ -1043,44 +1016,50 @@ class HyprModWindow(Adw.ApplicationWindow):
 
         # Cursor and env-vars pages both contribute to ``sections.env``.
         # Cursor owns the four ``XCURSOR_*`` / ``HYPRCURSOR_*`` names;
-        # env-vars owns everything else. Either page being dirty or having
-        # pre-existing managed lines triggers emission, and the cursor lines
-        # come first by convention (theme + size are session-defining; later
-        # vars may reference them indirectly).
-        cursor_env: list[str] = []
-        if self._cursor_page is not None:
-            has_managed_cursor = self._cursor_page.has_managed_env(saved_sections)
-            if has_managed_cursor or self._cursor_page.is_dirty():
-                cursor_env = self._cursor_page.get_env_lines()
-
-        general_env: list[str] = []
-        if self._env_vars_page is not None:
-            has_managed_env = EnvVarsPage.has_managed_section(saved_sections)
-            if has_managed_env or self._env_vars_page.is_dirty():
-                general_env = self._env_vars_page.get_env_lines()
-
+        # env-vars owns everything else. Cursor lines come first by
+        # convention (theme + size are session-defining; later vars may
+        # reference them indirectly).
+        cursor_env = (
+            emit_if(
+                self._cursor_page,
+                lambda p: p.has_managed_env(saved_sections),
+                lambda p: p.get_env_lines(),
+            )
+            or []
+        )
+        general_env = (
+            emit_if(
+                self._env_vars_page,
+                lambda _p: EnvVarsPage.has_managed_section(saved_sections),
+                lambda p: p.get_env_lines(),
+            )
+            or []
+        )
         if cursor_env or general_env:
             sections.env = [*cursor_env, *general_env]
 
-        if self._autostart_page is not None:
-            has_managed_autostart = AutostartPage.has_managed_section(saved_sections)
-            if has_managed_autostart or self._autostart_page.is_dirty():
-                sections.exec_ = self._autostart_page.get_exec_lines()
-
-        if self._window_rules_page is not None:
-            has_managed_rules = WindowRulesPage.has_managed_section(saved_sections)
-            if has_managed_rules or self._window_rules_page.is_dirty():
-                sections.window_rules = self._window_rules_page.get_window_rule_lines()
-
-        if self._layer_rules_page is not None:
-            has_managed_layers = LayerRulesPage.has_managed_section(saved_sections)
-            if has_managed_layers or self._layer_rules_page.is_dirty():
-                sections.layer_rules = self._layer_rules_page.get_layer_rule_lines()
+        sections.exec_ = emit_if(
+            self._autostart_page,
+            lambda _p: AutostartPage.has_managed_section(saved_sections),
+            lambda p: p.get_exec_lines(),
+        )
+        sections.window_rules = emit_if(
+            self._window_rules_page,
+            lambda _p: WindowRulesPage.has_managed_section(saved_sections),
+            lambda p: p.get_window_rule_lines(),
+        )
+        sections.layer_rules = emit_if(
+            self._layer_rules_page,
+            lambda _p: LayerRulesPage.has_managed_section(saved_sections),
+            lambda p: p.get_layer_rule_lines(),
+        )
 
         return sections
 
     def _perform_save(self, *, update_active_profile: bool = True):
-        config.write_all(self.app_state.get_all_live_values(), self._collect_save_sections())
+        # ``write_all`` invalidates ``config.read_cached`` internally, so any
+        # subsequent ``saved_sections`` access reflects what we just wrote.
+        config.write_all(self.app_state.get_all_live_values(), self.collect_save_sections())
         self.app_state.mark_saved()
         self.hypr.clear_pending()
         for section in self._section_pages:
@@ -1106,15 +1085,11 @@ class HyprModWindow(Adw.ApplicationWindow):
     def reload_after_profile(self):
         """Refresh all state after profile activation.
 
-        Re-reads saved config, updates managed flags, then calls
-        ``hypr.sync()`` which re-reads all state from the compositor
-        and fires change notifications — widgets and section pages
-        update themselves reactively.
+        ``profiles.activate_meta`` already invalidated the managed-config
+        cache, so the ``saved_sections`` accesses below see the new file.
+        Schema state is refreshed first, then per-page reloads, then
+        Hyprland's live state is re-read.
         """
-        # Re-read saved values from the new config file
-        self._saved_values, self._saved_sections = config.read_all_sections()
-
-        # Update managed flags from the new saved config
         self._update_managed_flags()
 
         # Sync options from live Hyprland (fires _on_state_changed per key)
@@ -1136,20 +1111,23 @@ class HyprModWindow(Adw.ApplicationWindow):
         if self._monitors_page is not None:
             self._monitors_page.reload_from_saved()
 
+        # Section pages that take a sections dict — read the freshly-invalidated
+        # cache once and hand it down so all pages see the same snapshot.
+        sections = self.saved_sections
         if self._cursor_page is not None:
-            self._cursor_page.reload_from_saved(self._saved_sections)
+            self._cursor_page.reload_from_saved(sections)
 
         if self._autostart_page is not None:
-            self._autostart_page.reload_from_saved(self._saved_sections)
+            self._autostart_page.reload_from_saved(sections)
 
         if self._env_vars_page is not None:
-            self._env_vars_page.reload_from_saved(self._saved_sections)
+            self._env_vars_page.reload_from_saved(sections)
 
         if self._window_rules_page is not None:
-            self._window_rules_page.reload_from_saved(self._saved_sections)
+            self._window_rules_page.reload_from_saved(sections)
 
         if self._layer_rules_page is not None:
-            self._layer_rules_page.reload_from_saved(self._saved_sections)
+            self._layer_rules_page.reload_from_saved(sections)
 
         self._undo.clear()
         self._banner.hide()
@@ -1157,8 +1135,9 @@ class HyprModWindow(Adw.ApplicationWindow):
     def _update_managed_flags(self):
         """Update managed flags and saved values from the current saved config."""
         options_flat = self._options_flat
+        saved_values = self.saved_values
         for key, state in self.app_state.options.items():
-            saved = self._saved_values.get(key)
+            saved = saved_values.get(key)
             if saved is not None:
                 option = options_flat.get(key)
                 if option:
@@ -1230,17 +1209,26 @@ class HyprModWindow(Adw.ApplicationWindow):
 
     # -- Auto-save --
 
+    def set_auto_save(self, value: bool) -> None:
+        """Update auto-save preference and keep the menu action in sync.
+
+        Single entry point for the settings-row toggle and the menu-item
+        action handler — both flow through here so the GSettings value,
+        the ``win.auto-save`` action state, and the settings-page row
+        stay in lock-step.
+        """
+        if self.auto_save == value:
+            return
+        self.auto_save = value
+        self._auto_save_action.set_state(GLib.Variant.new_boolean(value))
+        if self._settings_page is not None:
+            self._settings_page.sync_auto_save(value)
+        # If just enabled and there are unsaved changes, save immediately.
+        if value and self.has_dirty():
+            self.save()
+
     def _on_toggle_auto_save(self, action, _param):
-        new_val = not action.get_state().get_boolean()
-        action.set_state(GLib.Variant.new_boolean(new_val))
-        self.auto_save = new_val
-
-        if self._settings_page:
-            self._settings_page.sync_auto_save(new_val)
-
-        # If just enabled and there are unsaved changes, save immediately
-        if new_val and self.has_dirty():
-            self._on_save()
+        self.set_auto_save(not action.get_state().get_boolean())
 
     def _schedule_auto_save(self):
         """Debounced auto-save: wait 800ms after last change before writing."""

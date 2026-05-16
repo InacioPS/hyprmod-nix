@@ -15,15 +15,16 @@ without dragging the parser or the IPC layer along.
 from dataclasses import dataclass
 from typing import Literal
 
+from hyprland_config import V3_BOOL_EFFECTS
+
+from hyprmod.constants import APPLICATION_ID
 from hyprmod.core import config
 
 # HyprMod's own application id — the value Hyprland reports as ``class``
 # for our window. Used by :func:`matches_hyprmod` to gate live-apply
 # behind a confirmation dialog when a user-authored rule would target
 # the editor itself (e.g. floating or fading the running editor mid-edit).
-# Must stay in sync with ``application_id`` in ``hyprmod.main`` and the
-# ``StartupWMClass`` in our .desktop file.
-HYPRMOD_APP_ID: str = "io.github.bluemancz.hyprmod"
+HYPRMOD_APP_ID: str = APPLICATION_ID
 
 # Both keywords accepted on read. Output is always v3 ``windowrule``.
 # Legacy ``windowrulev2`` lines auto-migrate (see :mod:`._migrate`).
@@ -31,45 +32,12 @@ WINDOW_RULE_KEYWORDS: tuple[str, ...] = (
     config.KEYWORD_WINDOWRULE,
     config.KEYWORD_WINDOWRULEV2,
 )
-KEYWORD_WRITE: str = config.KEYWORD_WINDOWRULE
 
 # Sentinel matcher key for opaque tokens — anything in the matcher slot
 # that doesn't fit the v3 ``match:KEY VALUE`` shape (usually a custom
 # token someone pasted in) is round-tripped under this key with the
 # raw text in ``value``.
 RAW_KEY: str = "_raw"
-
-
-# ---------------------------------------------------------------------------
-# v3 constants
-# ---------------------------------------------------------------------------
-
-
-# v3 effects whose only argument is a boolean. We always emit ``on`` for
-# these — Hyprland 0.53+ treats a bare ``float`` (no value) as a config
-# error. The set is the union of the "static effects" that take ``[on]``
-# and the "dynamic effects" that take ``[on]``, per the v0.54 wiki.
-V3_BOOL_EFFECTS: frozenset[str] = frozenset(
-    {
-        # Static
-        "float", "tile", "fullscreen", "maximize", "center", "pseudo",
-        "no_initial_focus", "pin",
-        # Dynamic
-        "persistent_size", "no_max_size", "stay_focused",
-        "allows_input", "dim_around", "decorate", "focus_on_activate",
-        "keep_aspect_ratio", "nearest_neighbor",
-        "no_anim", "no_blur", "no_dim", "no_focus", "no_follow_mouse",
-        "no_shadow", "no_shortcuts_inhibit", "no_screen_share", "no_vrr",
-        "opaque", "force_rgbx", "sync_fullscreen", "immediate", "xray",
-        "render_unfocused",
-    }
-)  # fmt: skip
-
-
-# v3 matcher keys whose value is a boolean (``true``/``false``).
-V3_BOOL_MATCHERS: frozenset[str] = frozenset(
-    {"xwayland", "float", "fullscreen", "pin", "focus", "group", "modal"}
-)
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +59,7 @@ class Matcher:
     key: str
     value: str
 
-    def to_str(self) -> str:
+    def __str__(self) -> str:
         """Serialize as ``match:KEY VALUE`` (or raw text for RAW_KEY)."""
         if self.key == RAW_KEY:
             return self.value
@@ -140,13 +108,13 @@ class WindowRule:
         either order, but match-first reads more naturally as "for these
         windows, do this."
         """
-        parts = [m.to_str() for m in self.matchers]
+        parts = [str(m) for m in self.matchers]
         parts.append(self.effect_full)
         return ", ".join(parts)
 
     def to_line(self) -> str:
         """Serialize as the full ``windowrule = match:..., effect ...`` line."""
-        return f"{KEYWORD_WRITE} = {self.body()}"
+        return f"{config.KEYWORD_WINDOWRULE} = {self.body()}"
 
 
 # ---------------------------------------------------------------------------

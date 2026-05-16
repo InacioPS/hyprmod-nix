@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 from hyprland_monitors import MonitorState
 
+from hyprmod.core import config
 from hyprmod.pages.monitors.page import MonitorsPage
 
 
@@ -30,7 +31,14 @@ def _make_window(get_all_results: list[list[MonitorState]]) -> SimpleNamespace:
     monitors.get_all.side_effect = get_all_results
     monitors.apply.return_value = True
     hypr = SimpleNamespace(monitors=monitors, on_change=MagicMock(), document=None)
-    return SimpleNamespace(hypr=hypr, show_toast=MagicMock())
+    # Pages now read managed sections through ``window.saved_sections``
+    # rather than re-parsing per call; mirror that by reading once here.
+    _, saved_sections = config.read_all_sections()
+    return SimpleNamespace(
+        hypr=hypr,
+        show_toast=MagicMock(),
+        saved_sections=saved_sections,
+    )
 
 
 class TestRefreshAfterPortChange:

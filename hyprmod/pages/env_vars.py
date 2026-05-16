@@ -34,9 +34,8 @@ Reusable dialog lives in ``hyprmod.ui``:
 """
 
 from html import escape as html_escape
-from pathlib import Path
 
-from gi.repository import Adw, GLib, Gtk
+from gi.repository import Adw, Gtk
 
 from hyprmod.core import config
 from hyprmod.core.env_vars import (
@@ -49,12 +48,11 @@ from hyprmod.core.env_vars import (
     serialize,
 )
 from hyprmod.core.ownership import SavedList
-from hyprmod.core.setup import HYPRLAND_CONF
-from hyprmod.core.undo import SavedListSnapshot
 from hyprmod.pages.section import DragDropReorderMixin
-from hyprmod.ui import clear_children, display_path, make_inline_hint, make_page_layout
+from hyprmod.ui import make_inline_hint, make_page_layout
 from hyprmod.ui.empty_state import EmptyState
 from hyprmod.ui.env_var_edit_dialog import EnvVarEditDialog
+from hyprmod.ui.icons import ENV_VARS_ICON
 from hyprmod.ui.row_actions import RowActions
 
 # ---------------------------------------------------------------------------
@@ -64,6 +62,15 @@ from hyprmod.ui.row_actions import RowActions
 
 class EnvVarsPage(DragDropReorderMixin[EnvVar]):
     """List editor for ``env = NAME,value`` config entries."""
+
+    _unit_singular = "variable"
+    _unit_plural = "variables"
+    _page_attr = "_env_vars_page"
+    _pending_category = "Env Variables"
+    _pending_navigate_to = "env_vars"
+    _pending_icon = ENV_VARS_ICON
+    _group_title = "Variables"
+    _group_add_tooltip = "Add another variable"
 
     def __init__(
         self,
@@ -76,20 +83,18 @@ class EnvVarsPage(DragDropReorderMixin[EnvVar]):
         self._content_box: Gtk.Box
         self._scrolled: Gtk.ScrolledWindow
         self._owned: SavedList[EnvVar]
-        # Env vars from sourced config files outside our managed file —
-        # surfaced read-only with an override button. Rebuilt on every
-        # load (including profile switches), since their content can
-        # change without our involvement.
-        self._external: list[ExternalEnvVar] = []
-        self._rows_by_idx: list[Adw.ActionRow | None] = []
-        self._init_drag_state()
+        # Snapshot of which external names are shadowed by an owned
+        # entry; refreshed at the top of ``_rebuild_list`` so the
+        # base-class external-row renderer can read a stable value
+        # without recomputing per row.
+        self._overridden_external: set[str] = set()
         self._load(saved_sections)
 
     # ── Loading ──
 
     def _load(self, saved_sections: dict[str, list[str]] | None) -> None:
         if saved_sections is None:
-            _, saved_sections = config.read_all_sections()
+            saved_sections = self._window.saved_sections
         raw_lines = config.collect_section(saved_sections, config.KEYWORD_ENV)
         items = parse_env_lines(raw_lines)
         # Strip out cursor-owned vars so they show up only on the Cursor
@@ -103,32 +108,7 @@ class EnvVarsPage(DragDropReorderMixin[EnvVar]):
         # or any file it sources, excluding our managed file. The loader
         # also drops cursor-owned names so they're surfaced only on the
         # Cursor page.
-        self._external = load_external_env_vars(HYPRLAND_CONF, config.gui_conf())
-
-    # ── Undo / Redo ──
-
-    def _capture_undo(self):
-        return self._owned.snapshot()
-
-    def _undo_key(self) -> list[str]:
-        return [e.to_line() for e in self._owned]
-
-    def _build_undo_entry(self, old, new):
-        old_items, old_baselines = old
-        new_items, new_baselines = new
-        return SavedListSnapshot(
-            page_attr="_env_vars_page",
-            old_items=old_items,
-            new_items=new_items,
-            old_baselines=old_baselines,
-            new_baselines=new_baselines,
-        )
-
-    def restore_snapshot(self, items: list[EnvVar], baselines: list[EnvVar | None]) -> None:
-        """Restore state from an undo/redo snapshot."""
-        self._owned.restore(items, baselines)
-        self._rebuild_list()
-        self._notify_dirty()
+        self._external = load_external_env_vars(config.user_entry_path(), config.managed_path())
 
     # ── Build ──
 
@@ -147,47 +127,18 @@ class EnvVarsPage(DragDropReorderMixin[EnvVar]):
 
     # ── List rendering ──
 
-    def _rebuild_list(self, focus_idx: int = -1) -> None:
-        clear_children(self._content_box)
-        self._rows_by_idx = [None] * len(self._owned)
+    def _pre_rebuild(self) -> None:
+        # Snapshot once per rebuild so the external-row renderer can look
+        # up "is this entry shadowed by an owned line?" without threading
+        # the set through method signatures.
+        self._overridden_external = overridden_external_names(self._external, list(self._owned))
 
-        # Reorder hint shown only when there are at least two entries
-        # — with one or zero rows there's nothing to reorder.
-        if len(self._owned) >= 2:
-            self._content_box.append(
-                make_inline_hint(
-                    "Reorder entries by dragging them, "
-                    "or with Alt+↑ / Alt+↓ on a focused row. "
-                    "Order matters when one variable references another (e.g. ‘PATH’)."
-                )
-            )
-
-        if len(self._owned) > 0:
-            self._content_box.append(self._build_group())
-
-        # Surface deleted rows so the user can restore or re-confirm them.
-        deleted = self._deleted_baselines()
-        if deleted:
-            self._content_box.append(self._build_deleted_group(deleted))
-
-        # External vars from the user's hyprland.conf or sourced files —
-        # locked rows with an override button. Always at the bottom: it's
-        # reference info / starting point for overrides, not the primary
-        # content.
-        if self._external:
-            for widget in self._build_external_section():
-                self._content_box.append(widget)
-
-        if len(self._owned) == 0 and not deleted and not self._external:
-            self._content_box.append(self._build_empty_state())
-
-        if 0 <= focus_idx < len(self._rows_by_idx):
-            target = self._rows_by_idx[focus_idx]
-            if target is not None:
-                # Defer to idle so the row has actually been mapped
-                # before grab_focus runs (see ``_grab_focus_once`` in
-                # the base class for the SOURCE_REMOVE rationale).
-                GLib.idle_add(self._grab_focus_once, target)
+    def _build_order_hint(self) -> Gtk.Widget:
+        return make_inline_hint(
+            "Reorder entries by dragging them, "
+            "or with Alt+↑ / Alt+↓ on a focused row. "
+            "Order matters when one variable references another (e.g. ‘PATH’)."
+        )
 
     def _build_empty_state(self) -> EmptyState:
         return EmptyState(
@@ -197,49 +148,25 @@ class EnvVarsPage(DragDropReorderMixin[EnvVar]):
                 "hints (QT_QPA_PLATFORM), theme overrides, scaling settings, "
                 "and so on."
             ),
-            icon_name="utilities-terminal-symbolic",
+            icon_name=ENV_VARS_ICON,
             primary_action=("Add Variable…", self._on_add),
         )
 
-    def _build_group(self) -> Adw.PreferencesGroup:
-        n = len(self._owned)
-        group = Adw.PreferencesGroup(title="Variables")
-        group.set_description(f"{n} variable{'' if n == 1 else 's'}")
+    def _deleted_row_summary(self, item: EnvVar) -> tuple[str, str]:
+        return item.name, item.value or "(empty)"
 
-        add_btn = Gtk.Button(icon_name="list-add-symbolic")
-        add_btn.set_valign(Gtk.Align.CENTER)
-        add_btn.add_css_class("flat")
-        add_btn.set_tooltip_text("Add another variable")
-        add_btn.connect("clicked", lambda _b: self._on_add())
-        group.set_header_suffix(add_btn)
+    # ── Pending-changes summarizers ──
 
-        for idx in range(len(self._owned)):
-            group.add(self._make_row(idx, self._owned[idx]))
-        return group
+    def _summarize_item(self, item: EnvVar) -> tuple[str, str]:
+        return item.name, item.value or "(empty)"
 
-    def _build_deleted_group(self, deleted: list[EnvVar]) -> Adw.PreferencesGroup:
-        group = Adw.PreferencesGroup(title="Removed (pending save)")
-        n = len(deleted)
-        group.set_description(f"{n} variable{'' if n == 1 else 's'} will be removed on save")
-        for item in deleted:
-            row = Adw.ActionRow(
-                title=html_escape(item.name),
-                subtitle=html_escape(item.value or "(empty)"),
-            )
-            row.set_title_lines(1)
-            row.set_subtitle_lines(1)
-            row.add_css_class("option-default")
-            row.set_opacity(0.65)
-
-            restore_btn = Gtk.Button(icon_name="edit-undo-symbolic")
-            restore_btn.set_valign(Gtk.Align.CENTER)
-            restore_btn.add_css_class("flat")
-            restore_btn.set_tooltip_text("Restore this variable")
-            restore_btn.connect("clicked", lambda _b, e=item: self._on_restore_deleted(e))
-            row.add_suffix(restore_btn)
-
-            group.add(row)
-        return group
+    def _summarize_modified(self, baseline: EnvVar, item: EnvVar) -> tuple[str, str]:
+        if baseline.name != item.name:
+            # Renames (delete-old + add-new) shouldn't reach here — they
+            # appear as one "added" and one "removed" — but if the page
+            # ever supports in-place rename, surface both halves of the diff.
+            return item.name, f"{baseline.name} → {item.name}"
+        return item.name, f"{baseline.value or '(empty)'} → {item.value or '(empty)'}"
 
     def _make_row(self, idx: int, item: EnvVar) -> Adw.ActionRow:
         row = Adw.ActionRow(
@@ -251,7 +178,7 @@ class EnvVarsPage(DragDropReorderMixin[EnvVar]):
         row.set_title_lines(1)
         row.set_subtitle_lines(1)
 
-        prefix = Gtk.Image.new_from_icon_name("utilities-terminal-symbolic")
+        prefix = Gtk.Image.new_from_icon_name(ENV_VARS_ICON)
         prefix.set_opacity(0.6)
         prefix.set_pixel_size(28)
         row.add_prefix(prefix)
@@ -285,34 +212,14 @@ class EnvVarsPage(DragDropReorderMixin[EnvVar]):
         return row
 
     # ── External (read-only display + override flow) ──
-
-    def _build_external_section(self) -> list[Gtk.Widget]:
-        """Build the read-only external-vars display.
-
-        Returns an inline hint + one PreferencesGroup per source file —
-        same grouping pattern as the layer-rules page so users see one
-        path-as-title per file instead of repeating it on every row.
-
-        Entries already overridden by an owned line are visually muted
-        and badged "Overridden" instead of carrying the override
-        button — a second override would be redundant.
-        """
-        widgets: list[Gtk.Widget] = [self._build_external_hint()]
-
-        # ``find_all`` returns env entries in source-traversal order, so
-        # a plain (insertion-ordered) dict gives us the right grouping
-        # for free.
-        by_file: dict[Path, list[ExternalEnvVar]] = {}
-        for ext in self._external:
-            by_file.setdefault(ext.source_path, []).append(ext)
-
-        overridden = overridden_external_names(self._external, list(self._owned))
-        for source_path, entries in by_file.items():
-            widgets.append(self._build_external_file_group(source_path, entries, overridden))
-        return widgets
+    #
+    # External-section layout (hint + per-file groups) uses the base
+    # ``SavedListSectionPage`` template; ``_make_external_row`` reads
+    # the cached ``_overridden_external`` set so it can muted-badge
+    # already-overridden entries instead of offering a redundant
+    # override button.
 
     def _build_external_hint(self) -> Gtk.Widget:
-        """Inline note: explains override semantics + read-only nature."""
         return make_inline_hint(
             "Variables below come from your hyprland.conf or its "
             "sourced files. Click the edit button to override them — "
@@ -320,22 +227,9 @@ class EnvVarsPage(DragDropReorderMixin[EnvVar]):
             "Hyprland session."
         )
 
-    def _build_external_file_group(
-        self,
-        source_path: Path,
-        entries: list[ExternalEnvVar],
-        overridden: set[str],
-    ) -> Adw.PreferencesGroup:
-        """A PreferencesGroup containing every external var from one file."""
-        group = Adw.PreferencesGroup(title=display_path(source_path))
-        n = len(entries)
-        group.set_description(f"{n} variable{'' if n == 1 else 's'}")
-        for ext in entries:
-            group.add(self._make_external_row(ext, is_overridden=ext.var.name in overridden))
-        return group
-
-    def _make_external_row(self, ext: ExternalEnvVar, *, is_overridden: bool) -> Adw.ActionRow:
+    def _make_external_row(self, ext: ExternalEnvVar) -> Adw.ActionRow:
         """One locked row representing an external env var."""
+        is_overridden = ext.var.name in self._overridden_external
         # Subtitle = value + line number. Path is already in the group
         # title, so we don't repeat it on every row.
         subtitle = f"{ext.var.value or '(empty)'}  ·  line {ext.lineno}"
@@ -350,7 +244,7 @@ class EnvVarsPage(DragDropReorderMixin[EnvVar]):
         row.set_opacity(0.65)
         row.set_tooltip_text(f"{ext.source_path}:{ext.lineno}")
 
-        prefix = Gtk.Image.new_from_icon_name("utilities-terminal-symbolic")
+        prefix = Gtk.Image.new_from_icon_name(ENV_VARS_ICON)
         prefix.set_opacity(0.4)
         prefix.set_pixel_size(28)
         row.add_prefix(prefix)
@@ -398,47 +292,26 @@ class EnvVarsPage(DragDropReorderMixin[EnvVar]):
         already filtered out by :func:`load_external_env_vars`, so
         users can only land here with a non-reserved name.
         """
-        owned = self._owned
-
-        def on_apply(new_item: EnvVar) -> None:
-            with self._undo_track():
-                owned.append_new(new_item)
-            self._notify_dirty()
-            self._rebuild_list()
-
         EnvVarEditDialog.present_singleton(
             self._window,
             entry=ext.var,
             is_override=True,
-            on_apply=on_apply,
+            on_apply=self._commit_appended,
         )
 
     # ── Add / Edit / Remove ──
 
     def _on_add(self) -> None:
-        owned = self._owned
-
-        def on_apply(new_item: EnvVar) -> None:
-            with self._undo_track():
-                owned.append_new(new_item)
-            self._notify_dirty()
-            self._rebuild_list()
-
-        EnvVarEditDialog.present_singleton(self._window, on_apply=on_apply)
+        EnvVarEditDialog.present_singleton(self._window, on_apply=self._commit_appended)
 
     def _on_edit_at(self, idx: int) -> None:
-        owned = self._owned
-        if idx < 0 or idx >= len(owned):
+        if idx < 0 or idx >= len(self._owned):
             return
-        current = owned[idx]
+        current = self._owned[idx]
 
         def on_apply(new_item: EnvVar) -> None:
-            if new_item == current:
-                return
-            with self._undo_track():
-                owned[idx] = new_item
-            self._notify_dirty()
-            self._rebuild_list()
+            if new_item != current:
+                self._commit_replaced(idx, new_item)
 
         EnvVarEditDialog.present_singleton(
             self._window,
@@ -446,37 +319,9 @@ class EnvVarsPage(DragDropReorderMixin[EnvVar]):
             on_apply=on_apply,
         )
 
-    def _on_delete_at(self, idx: int) -> None:
-        if idx < 0 or idx >= len(self._owned):
-            return
-        with self._undo_track():
-            self._owned.pop_at(idx)
-        self._notify_dirty()
-        self._rebuild_list()
-
-    def _discard_at(self, idx: int) -> None:
-        """Revert a single entry to its saved value (or remove if unsaved)."""
-        baseline = self._owned.get_baseline(idx)
-        if baseline is None:
-            self._on_delete_at(idx)
-            return
-        with self._undo_track():
-            self._owned.discard_at(idx)
-        self._notify_dirty()
-        self._rebuild_list()
-
-    def _on_restore_deleted(self, item: EnvVar) -> None:
-        """Restore a previously-deleted entry to its saved position.
-
-        Routes through :meth:`SavedList.restore_deleted` so the row
-        comes back with its saved baseline at the slot consistent with
-        the saved order — a pure delete-then-restore round trip leaves
-        the page non-dirty.
-        """
-        with self._undo_track():
-            self._owned.restore_deleted(item)
-        self._notify_dirty()
-        self._rebuild_list()
+    # ``_on_delete_at`` / ``_discard_at`` / ``_on_restore_deleted`` use
+    # the base ``SavedListSectionPage`` defaults — env vars don't have
+    # any live-apply side effects, so no override is needed.
 
     # ── Save plumbing ──
 

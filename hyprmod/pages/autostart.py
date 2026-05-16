@@ -24,7 +24,7 @@ import shlex
 import subprocess
 from html import escape as html_escape
 
-from gi.repository import Adw, GLib, Gtk
+from gi.repository import Adw, Gtk
 
 from hyprmod.core import config
 from hyprmod.core.autostart import (
@@ -36,12 +36,12 @@ from hyprmod.core.autostart import (
 )
 from hyprmod.core.desktop_apps import DesktopApp, list_apps, match_command
 from hyprmod.core.ownership import SavedList
-from hyprmod.core.undo import SavedListSnapshot
 from hyprmod.pages.section import DragDropReorderMixin
-from hyprmod.ui import clear_children, make_inline_hint, make_page_layout
+from hyprmod.ui import make_inline_hint, make_page_layout
 from hyprmod.ui.app_picker import AppPickerDialog
 from hyprmod.ui.autostart_edit_dialog import AutostartEditDialog
 from hyprmod.ui.empty_state import EmptyState
+from hyprmod.ui.icons import AUTOSTART_ICON
 from hyprmod.ui.row_actions import RowActions
 
 # ---------------------------------------------------------------------------
@@ -51,6 +51,11 @@ from hyprmod.ui.row_actions import RowActions
 
 class AutostartPage(DragDropReorderMixin[ExecData]):
     """List editor for ``exec`` / ``exec-once`` config entries."""
+
+    _page_attr = "_autostart_page"
+    _pending_category = "Autostart"
+    _pending_navigate_to = "autostart"
+    _pending_icon = AUTOSTART_ICON
 
     def __init__(
         self,
@@ -70,50 +75,16 @@ class AutostartPage(DragDropReorderMixin[ExecData]):
         # them until restart — acceptable for now; we can hook into
         # ``Gio.AppInfoMonitor`` later if it becomes a complaint.
         self._installed_apps: list[DesktopApp] = list_apps()
-        # Maps each owned-list index to the ``Adw.ActionRow`` widget
-        # currently representing it. Rebuilt on every ``_rebuild_list``
-        # call: pre-sized with ``None`` slots and filled in as
-        # ``_make_row`` runs, so a freshly-rebuilt list briefly has
-        # ``None`` entries before all rows are constructed. Used by
-        # the keyboard reorder path (Alt+Up/Down) to refocus the
-        # moved row post-rebuild for chained shortcuts.
-        self._rows_by_idx: list[Adw.ActionRow | None] = []
-        self._init_drag_state()
         self._load(saved_sections)
 
     # ── Loading ──
 
     def _load(self, saved_sections: dict[str, list[str]] | None) -> None:
         if saved_sections is None:
-            _, saved_sections = config.read_all_sections()
+            saved_sections = self._window.saved_sections
         raw_lines = config.collect_section(saved_sections, *EXEC_KEYWORDS)
         items = parse_exec_lines(raw_lines)
         self._owned = SavedList(items, key=lambda e: e.to_line())
-
-    # ── Undo / Redo ──
-
-    def _capture_undo(self):
-        return self._owned.snapshot()
-
-    def _undo_key(self) -> list[str]:
-        return [e.to_line() for e in self._owned]
-
-    def _build_undo_entry(self, old, new):
-        old_items, old_baselines = old
-        new_items, new_baselines = new
-        return SavedListSnapshot(
-            page_attr="_autostart_page",
-            old_items=old_items,
-            new_items=new_items,
-            old_baselines=old_baselines,
-            new_baselines=new_baselines,
-        )
-
-    def restore_snapshot(self, items: list[ExecData], baselines: list[ExecData | None]) -> None:
-        """Restore state from an undo/redo snapshot."""
-        self._owned.restore(items, baselines)
-        self._rebuild_list()
-        self._notify_dirty()
 
     # ── Build ──
 
@@ -132,53 +103,51 @@ class AutostartPage(DragDropReorderMixin[ExecData]):
 
     # ── List rendering ──
 
-    def _rebuild_list(self, focus_idx: int = -1) -> None:
-        clear_children(self._content_box)
-        # Pre-size with ``None`` slots; ``_make_row`` fills each as it
-        # runs. Sparse list is fine while rows are still being built —
-        # the type annotation in ``__init__`` admits ``None``.
-        self._rows_by_idx = [None] * len(self._owned)
+    def _build_order_hint(self) -> Gtk.Widget:
+        return make_inline_hint(
+            "Reorder entries by dragging them within their group, "
+            "or with Alt+↑ / Alt+↓ on a focused row."
+        )
 
-        # Reorder hint shown only when there are at least two entries
-        # — with one or zero rows there's nothing to reorder, so the
-        # hint would just be noise.
-        if len(self._owned) >= 2:
-            self._content_box.append(
-                make_inline_hint(
-                    "Reorder entries by dragging them within their group, "
-                    "or with Alt+↑ / Alt+↓ on a focused row."
-                )
-            )
-
-        # Group by keyword so users can scan startup vs. reload separately.
-        by_keyword: dict[str, list[tuple[int, ExecData]]] = {kw: [] for kw in EXEC_KEYWORDS}
+    def _build_managed_groups(self) -> list[Gtk.Widget]:
+        """Group entries by keyword so users can scan startup vs. reload separately."""
+        by_keyword: dict[str, list[int]] = {kw: [] for kw in EXEC_KEYWORDS}
         for idx, item in enumerate(self._owned):
-            by_keyword.setdefault(item.keyword, []).append((idx, item))
+            by_keyword.setdefault(item.keyword, []).append(idx)
 
-        any_rows = False
+        widgets: list[Gtk.Widget] = []
         for kw in EXEC_KEYWORDS:
-            entries = by_keyword.get(kw, [])
-            if not entries:
+            indices = by_keyword.get(kw, [])
+            if not indices:
                 continue
-            any_rows = True
-            self._content_box.append(self._build_group(kw, entries))
+            widgets.append(self._build_keyword_group(kw, indices))
+        return widgets
 
-        # Surface deleted rows so the user can restore or re-confirm them.
-        deleted = self._deleted_baselines()
-        if deleted:
-            any_rows = True
-            self._content_box.append(self._build_deleted_group(deleted))
+    def _build_keyword_group(self, keyword: str, indices: list[int]) -> Adw.PreferencesGroup:
+        """One group per ``exec`` / ``exec-once`` keyword.
 
-        if not any_rows:
-            self._content_box.append(self._build_empty_state())
+        Mirrors :meth:`SavedListSectionPage._build_managed_group` but each
+        group's "+" button defaults to the matching keyword's advanced
+        toggle (``exec`` defaults to advanced, ``exec-once`` does not).
+        """
+        label = KEYWORD_LABELS.get(keyword, keyword)
+        group = Adw.PreferencesGroup(title=label)
+        n = len(indices)
+        group.set_description(f"{n} {self._unit_label(n)}")
 
-        if 0 <= focus_idx < len(self._rows_by_idx):
-            target = self._rows_by_idx[focus_idx]
-            if target is not None:
-                # Defer to idle so the row has actually been mapped
-                # before grab_focus runs (see ``_grab_focus_once`` in
-                # the base class for the SOURCE_REMOVE rationale).
-                GLib.idle_add(self._grab_focus_once, target)
+        add_btn = Gtk.Button(icon_name="list-add-symbolic")
+        add_btn.set_valign(Gtk.Align.CENTER)
+        add_btn.add_css_class("flat")
+        add_btn.set_tooltip_text(f"Add another entry that runs {label.lower()}")
+        add_btn.connect(
+            "clicked",
+            lambda _b, kw=keyword: self._on_add(default_advanced=kw == config.KEYWORD_EXEC),
+        )
+        group.set_header_suffix(add_btn)
+
+        for idx in indices:
+            group.add(self._make_row(idx, self._owned[idx]))
+        return group
 
     def _build_empty_state(self) -> EmptyState:
         """Empty-state page with two action buttons.
@@ -191,70 +160,40 @@ class AutostartPage(DragDropReorderMixin[ExecData]):
         return EmptyState(
             title="No Autostart Entries",
             description="Add programs that should launch automatically when Hyprland starts.",
-            icon_name="media-playback-start-symbolic",
+            icon_name=AUTOSTART_ICON,
             primary_action=("Pick from Installed Apps", self._on_quick_pick),
             secondary_action=("Custom Command…", self._on_add),
         )
 
-    def _build_group(
-        self, keyword: str, entries: list[tuple[int, ExecData]]
-    ) -> Adw.PreferencesGroup:
-        group = Adw.PreferencesGroup(title=KEYWORD_LABELS.get(keyword, keyword))
-        group.set_description(f"{len(entries)} entr{'ies' if len(entries) != 1 else 'y'}")
+    def _deleted_row_summary(self, item: ExecData) -> tuple[str, str]:
+        matched = match_command(item.command, self._installed_apps)
+        keyword_label = KEYWORD_LABELS.get(item.keyword, item.keyword)
+        if matched is not None:
+            return matched.name, f"{keyword_label} · {item.command}"
+        return item.command, keyword_label
 
-        add_btn = Gtk.Button(icon_name="list-add-symbolic")
-        add_btn.set_valign(Gtk.Align.CENTER)
-        add_btn.add_css_class("flat")
-        label = KEYWORD_LABELS.get(keyword, keyword).lower()
-        add_btn.set_tooltip_text(f"Add another entry that runs {label}")
-        add_btn.connect(
-            "clicked",
-            lambda _b, kw=keyword: self._on_add(default_advanced=kw == config.KEYWORD_EXEC),
-        )
-        group.set_header_suffix(add_btn)
+    # ── Pending-changes summarizers ──
 
-        for idx, item in entries:
-            group.add(self._make_row(idx, item))
-        return group
+    def _summarize_item(self, item: ExecData) -> tuple[str, str]:
+        return item.command, KEYWORD_LABELS.get(item.keyword, item.keyword)
 
-    def _build_deleted_group(self, deleted: list[ExecData]) -> Adw.PreferencesGroup:
-        group = Adw.PreferencesGroup(title="Removed (pending save)")
-        group.set_description(
-            f"{len(deleted)} entr{'ies' if len(deleted) != 1 else 'y'} will be removed on save"
-        )
-        for item in deleted:
-            matched = match_command(item.command, self._installed_apps)
-            keyword_label = KEYWORD_LABELS.get(item.keyword, item.keyword)
-            if matched is not None:
-                title = matched.name
-                subtitle = f"{keyword_label} · {item.command}"
-            else:
-                title = item.command
-                subtitle = keyword_label
+    def _summarize_modified(self, baseline: ExecData, item: ExecData) -> tuple[str, str]:
+        new_label = KEYWORD_LABELS.get(item.keyword, item.keyword)
+        if baseline.command != item.command:
+            subtitle = f"{baseline.command} → {item.command}"
+        else:
+            old_label = KEYWORD_LABELS.get(baseline.keyword, baseline.keyword)
+            subtitle = f"{old_label} → {new_label}"
+        return item.command, subtitle
 
-            row = Adw.ActionRow(
-                title=html_escape(title),
-                subtitle=html_escape(subtitle),
-            )
-            row.set_title_lines(1)
-            row.set_subtitle_lines(1)
-            row.add_css_class("option-default")
-            row.set_opacity(0.65)
-
-            if matched is not None and matched.icon_name:
-                prefix = Gtk.Image.new_from_icon_name(matched.icon_name)
-                prefix.set_pixel_size(32)
-                row.add_prefix(prefix)
-
-            restore_btn = Gtk.Button(icon_name="edit-undo-symbolic")
-            restore_btn.set_valign(Gtk.Align.CENTER)
-            restore_btn.add_css_class("flat")
-            restore_btn.set_tooltip_text("Restore this entry")
-            restore_btn.connect("clicked", lambda _b, e=item: self._on_restore_deleted(e))
-            row.add_suffix(restore_btn)
-
-            group.add(row)
-        return group
+    def _make_deleted_row(self, item: ExecData) -> Adw.ActionRow:
+        row = super()._make_deleted_row(item)
+        matched = match_command(item.command, self._installed_apps)
+        if matched is not None and matched.icon_name:
+            prefix = Gtk.Image.new_from_icon_name(matched.icon_name)
+            prefix.set_pixel_size(32)
+            row.add_prefix(prefix)
+        return row
 
     def _make_row(self, idx: int, item: ExecData) -> Adw.ActionRow:
         # Match against installed apps so a row picked from the picker
@@ -284,7 +223,7 @@ class AutostartPage(DragDropReorderMixin[ExecData]):
             prefix = Gtk.Image.new_from_icon_name(matched.icon_name)
             prefix.set_pixel_size(32)
         else:
-            prefix = Gtk.Image.new_from_icon_name("media-playback-start-symbolic")
+            prefix = Gtk.Image.new_from_icon_name(AUTOSTART_ICON)
             prefix.set_opacity(0.6)
         row.add_prefix(prefix)
 
@@ -397,37 +336,10 @@ class AutostartPage(DragDropReorderMixin[ExecData]):
             on_apply=on_apply,
         )
 
-    def _on_delete_at(self, idx: int) -> None:
-        if idx < 0 or idx >= len(self._owned):
-            return
-        with self._undo_track():
-            self._owned.pop_at(idx)
-        self._notify_dirty()
-        self._rebuild_list()
-
-    def _discard_at(self, idx: int) -> None:
-        """Revert a single entry to its saved value (or remove if unsaved)."""
-        baseline = self._owned.get_baseline(idx)
-        if baseline is None:
-            self._on_delete_at(idx)
-            return
-        with self._undo_track():
-            self._owned.discard_at(idx)
-        self._notify_dirty()
-        self._rebuild_list()
-
-    def _on_restore_deleted(self, item: ExecData) -> None:
-        """Restore a previously-deleted entry to its saved position.
-
-        Routes through :meth:`SavedList.restore_deleted` so the row
-        comes back with its saved baseline at the slot consistent with
-        the saved order — a pure delete-then-restore round trip leaves
-        the page non-dirty.
-        """
-        with self._undo_track():
-            self._owned.restore_deleted(item)
-        self._notify_dirty()
-        self._rebuild_list()
+    # ``_on_delete_at`` / ``_discard_at`` / ``_on_restore_deleted`` use
+    # the base ``SavedListSectionPage`` defaults — autostart has no
+    # live-apply side effects (``exec``/``exec-once`` only fire at
+    # compositor reload).
 
     # ── Run-now ──
 

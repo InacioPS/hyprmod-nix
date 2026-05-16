@@ -8,16 +8,13 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from hyprland_config import (
-    Assignment,
     BindData,
     Document,
     Keyword,
     is_bind_keyword,
+    load_any,
     parse_bind_line,
 )
-from hyprland_config import load as load_document
-
-from hyprmod.core import config
 
 
 class OverrideTracker:
@@ -25,16 +22,42 @@ class OverrideTracker:
 
     This allows HyprMod to emit 'unbind' lines in the config for overridden
     binds, and to filter the Hyprland bind list to avoid showing duplicates.
+
+    *managed_path* identifies hyprmod's own config file so unbind lines
+    written there can be excluded when resolving overrides from the
+    user's hyprland.conf tree. Taking the path as a constructor argument
+    (rather than calling back into hyprmod modules) keeps this class
+    portable — it has no other hyprmod-side dependencies. ``None`` is
+    accepted so the in-memory operations (filter, add_override, …) are
+    usable without a config file; the file-reading paths
+    (``parse_saved_overrides``, the post-restart config-order resolver)
+    degrade gracefully when no path is set.
     """
 
-    def __init__(self, all_hypr_binds: list[BindData], document: Document | None = None):
+    def __init__(
+        self,
+        all_hypr_binds: list[BindData],
+        managed_path: Path | None = None,
+        document: Document | None = None,
+    ):
         self._hypr_binds = list(all_hypr_binds)
         self._hypr_by_combo: dict[tuple, BindData] = {b.combo: b for b in self._hypr_binds}
         self._document = document
+        self._managed_path = managed_path
         # Session overrides: owned_index -> original BindData
         self._session_overrides: dict[int, BindData] = {}
         # Saved overrides (from config file): owned_index -> original BindData
         self._saved_overrides: dict[int, BindData] = {}
+
+    def _excluded_paths(self) -> frozenset[Path]:
+        """Source paths to skip when walking the user's config document.
+
+        Empty when no managed path is set (tests that exercise in-memory
+        operations without a config file).
+        """
+        if self._managed_path is None:
+            return frozenset()
+        return frozenset({self._managed_path.resolve()})
 
     def add_override(self, owned_index: int, original: BindData) -> None:
         """Mark an owned bind as overriding a Hyprland bind."""
@@ -102,7 +125,7 @@ class OverrideTracker:
         """
         if self._document is None:
             return None
-        excluded = frozenset({Path(config.gui_conf()).resolve()})
+        excluded = self._excluded_paths()
         config_order: list[tuple] = []
         for kw in self._document.find_all("bind*", exclude_sources=excluded):
             expanded = self._document.expand(kw.raw.strip())
@@ -146,74 +169,124 @@ class OverrideTracker:
         return [hb for hb in self._hypr_binds if hb.combo not in overridden_combos]
 
     def get_bind_lines(self, owned_binds: Sequence[BindData]) -> list[str]:
-        """Generate config lines: unbind for overrides, then bind for all owned."""
-        lines = []
-        unbind_combos: set[tuple] = set()
+        """Generate config lines: each unbind directly precedes its replacement bind.
 
-        # Collect all original combos that need unbinding.
-        # Use the original BindData's key/mods_str to preserve casing —
-        # Hyprland's unbind is case-sensitive.
+        Adjacency is load-bearing — :meth:`parse_saved_overrides` walks
+        lines top-down and pairs each ``unbind`` with the *next* bind it
+        sees, so any unrelated bind between them gets mis-paired and the
+        override is lost on the next save/restart. Emitting them as a
+        tight pair keeps that round-trip correct, and gives readers a
+        self-documenting "this bind replaces that one" layout in both
+        Hyprlang and Lua output. The Hyprland processing order (unbind
+        first, then re-bind) is preserved regardless of the surrounding
+        binds.
+        """
+        lines: list[str] = []
+        seen_unbinds: set[tuple] = set()
+
         for idx, bind in enumerate(owned_binds):
+            # Determine which combo this bind needs to unbind first, if any.
+            # Use the original BindData's key/mods_str to preserve casing —
+            # Hyprland's unbind is case-sensitive.
+            unbind_combo: tuple | None = None
+            unbind_line: str | None = None
             original = self.get_original(idx)
             if original is not None:
-                combo = original.combo
-                if combo not in unbind_combos:
-                    unbind_combos.add(combo)
-                    lines.append(f"unbind = {original.mods_str}, {original.key}")
+                unbind_combo = original.combo
+                unbind_line = f"unbind = {original.mods_str}, {original.key}"
             elif bind.combo in self._hypr_by_combo:
-                combo = bind.combo
-                if combo not in unbind_combos:
-                    unbind_combos.add(combo)
-                    source = self._hypr_by_combo[combo]
-                    lines.append(f"unbind = {source.mods_str}, {source.key}")
+                unbind_combo = bind.combo
+                source = self._hypr_by_combo[unbind_combo]
+                unbind_line = f"unbind = {source.mods_str}, {source.key}"
 
-        # Emit bind lines
-        for bind in owned_binds:
+            if unbind_combo is not None and unbind_combo not in seen_unbinds:
+                seen_unbinds.add(unbind_combo)
+                lines.append(unbind_line)  # type: ignore[arg-type]
+
             lines.append(bind.to_line())
+
         return lines
 
     def parse_saved_overrides(self, owned_binds: Sequence[BindData]) -> None:
         """Parse unbind+bind pairs from the saved config to restore override tracking.
 
-        Reads the current GUI_CONF and matches unbind lines to owned binds.
-        Uses hyprland_config to parse keywords in document order (rather than
-        manual line splitting) so parsing stays consistent with the library.
+        Reads the current managed config and matches unbind lines to owned
+        binds. Uses hyprland_config to parse keywords in document order so
+        parsing stays consistent with the library.
+
+        Pairing strategy: for each unbind, prefer a bind with the *same*
+        combo (a same-combo override) over the next bind in the document.
+        This is robust to older managed files that emitted unbinds in a
+        leading block separated from their replacement binds — without it,
+        ``unbind X`` ahead of unrelated binds would silently get paired
+        with the wrong one and corrupt the override state.
         """
         self._saved_overrides.clear()
-        if not config.gui_conf().exists():
+        if self._managed_path is None or not self._managed_path.exists():
             return
 
-        doc = load_document(config.gui_conf(), follow_sources=False)
+        doc = load_any(self._managed_path, follow_sources=False, lenient=True)
 
-        # Walk all lines in document order, pairing unbind -> next bind.
-        # Assignments between unbind and bind break the pairing.
-        unbind_bind_pairs: list[tuple[tuple, tuple]] = []
-        pending_unbind: tuple | None = None
+        # Collect every unbind and every bind in document order, tagged
+        # with their line position. Position lets us fall back to "first
+        # following bind" for changed-combo overrides while still ranking
+        # same-combo matches first.
+        unbinds: list[tuple[int, tuple]] = []
+        binds: list[tuple[int, tuple]] = []
 
-        for node in doc.lines:
-            if isinstance(node, Assignment):
-                pending_unbind = None
-                continue
+        for idx, node in enumerate(doc.lines):
             if not isinstance(node, Keyword):
                 continue
-
-            if node.key == config.KEYWORD_UNBIND:
+            if node.key == "unbind":
                 parts = [p.strip() for p in node.value.split(",", 1)]
                 if len(parts) == 2:
                     mods = tuple(sorted(m.upper() for m in parts[0].split() if m.strip()))
                     k = parts[1].strip().upper()
-                    pending_unbind = (mods, k)
+                    unbinds.append((idx, (mods, k)))
                 continue
-
-            if is_bind_keyword(node.key) and pending_unbind is not None:
+            if is_bind_keyword(node.key):
                 bind_data = parse_bind_line(node.raw.strip())
                 if bind_data is not None:
-                    unbind_bind_pairs.append((pending_unbind, bind_data.combo))
-                pending_unbind = None
-                continue
+                    binds.append((idx, bind_data.combo))
 
-            # Any other keyword resets pending unbind
-            pending_unbind = None
+        # Two-pass match. Pass 1 claims same-combo binds (the common case —
+        # same-combo overrides keep the user's bound key but change the
+        # action). Pass 2 hands each remaining unbind to its closest
+        # following unclaimed bind (changed-combo override — the user
+        # moved the binding to a different key).
+        used_bind_positions: set[int] = set()
+        unbind_bind_pairs: list[tuple[tuple, tuple]] = []
+
+        for _ub_pos, ub_combo in unbinds:
+            match = next(
+                (
+                    (b_pos, b_combo)
+                    for b_pos, b_combo in binds
+                    if b_pos not in used_bind_positions and b_combo == ub_combo
+                ),
+                None,
+            )
+            if match is not None:
+                b_pos, b_combo = match
+                unbind_bind_pairs.append((ub_combo, b_combo))
+                used_bind_positions.add(b_pos)
+
+        for ub_pos, ub_combo in unbinds:
+            already_paired = any(uc == ub_combo for uc, _ in unbind_bind_pairs)
+            if already_paired:
+                continue
+            match = next(
+                (
+                    (b_pos, b_combo)
+                    for b_pos, b_combo in binds
+                    if b_pos > ub_pos and b_pos not in used_bind_positions
+                ),
+                None,
+            )
+            if match is not None:
+                b_pos, b_combo = match
+                unbind_bind_pairs.append((ub_combo, b_combo))
+                used_bind_positions.add(b_pos)
 
         # Match unbind_bind_pairs to owned binds.
         # Prefer the config document (excluding GUI_CONF) over live binds:
@@ -239,7 +312,7 @@ class OverrideTracker:
         """
         if self._document is None:
             return None
-        excluded = frozenset({Path(config.gui_conf()).resolve()})
+        excluded = self._excluded_paths()
         for kw in reversed(self._document.find_all("bind*", exclude_sources=excluded)):
             expanded = self._document.expand(kw.raw.strip())
             bd = parse_bind_line(expanded)
@@ -259,8 +332,14 @@ class OverrideTracker:
         return copy.deepcopy(self._session_overrides)
 
     def restore_session(self, overrides: dict[int, BindData]) -> None:
-        """Replace session overrides from an undo/redo snapshot."""
-        self._session_overrides = dict(overrides)
+        """Replace session overrides from an undo/redo snapshot.
+
+        Deep-copies so subsequent mutations to ``_session_overrides`` (or to
+        the BindData values inside it) don't leak back into the snapshot the
+        undo entry holds — snapshot_session() deep-copies on capture for the
+        same reason.
+        """
+        self._session_overrides = copy.deepcopy(dict(overrides))
 
     def clear_session_overrides(self) -> list[BindData]:
         """Clear all session overrides and return the originals.

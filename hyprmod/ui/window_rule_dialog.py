@@ -25,6 +25,7 @@ from collections.abc import Callable
 from gi.repository import Adw, Gtk
 from hyprland_socket import Window
 
+from hyprmod.core import config
 from hyprmod.core.window_rules import (
     ACTION_PRESETS,
     CUSTOM_MATCHER_KIND,
@@ -40,7 +41,7 @@ from hyprmod.core.window_rules import (
     lookup_matcher_kind,
     lookup_preset,
 )
-from hyprmod.ui import build_preview_group
+from hyprmod.ui import build_preview_group, format_config_preview
 from hyprmod.ui.dialog import SingletonDialogMixin
 from hyprmod.ui.window_picker import WindowPickerDialog
 
@@ -471,7 +472,12 @@ class WindowRuleEditDialog(SingletonDialogMixin, Adw.Dialog):
 
     def _refresh(self) -> None:
         rule = self._build_rule()
-        self._preview_label.set_text(rule.to_line() if rule is not None else "(rule incomplete)")
+        if rule is None:
+            self._preview_label.set_text("(rule incomplete)")
+        else:
+            self._preview_label.set_text(
+                format_config_preview(config.KEYWORD_WINDOWRULE, rule.body())
+            )
         # Apply gates on a non-empty effect name AND at least one
         # non-empty matcher. This rejects both halves of an incomplete
         # rule, both of which Hyprland would reject at runtime.

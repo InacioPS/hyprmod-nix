@@ -1,76 +1,32 @@
 """Keybind management page — categorized list with override support."""
 
 import copy
+from collections.abc import Iterator
 from html import escape as html_escape
 
 from gi.repository import Adw, GLib, Gtk
 from hyprland_config import BindData, parse_bind_line
-from hyprland_socket import Bind, HyprlandError, modmask_to_str
+from hyprland_socket import HyprlandError
 
 from hyprmod.binds import (
     CATEGORY_BY_ID,
     DISPATCHER_CATEGORIES,
     OverrideTracker,
     categorize_bind,
+    enrich_lua_binds,
     format_bind_action,
+    live_bind_to_data,
 )
 from hyprmod.binds.dialog import BindEditDialog
 from hyprmod.core import config
 from hyprmod.core.ownership import SavedList
+from hyprmod.core.pending import PendingChange
 from hyprmod.core.undo import BindsUndoEntry
 from hyprmod.pages.section import SectionPage
-from hyprmod.ui import clear_children, make_page_layout, try_with_toast
+from hyprmod.ui import clear_children, make_inline_hint, make_page_layout, try_with_toast
 from hyprmod.ui.empty_state import EmptyState
+from hyprmod.ui.icons import BINDS_ICON
 from hyprmod.ui.row_actions import RowActions
-
-# ---------------------------------------------------------------------------
-# Live bind conversion
-# ---------------------------------------------------------------------------
-
-
-def _live_bind_to_data(b: Bind) -> BindData:
-    """Convert a Hyprland live ``Bind`` to a ``BindData``.
-
-    Hyprland reports flag-variant binds (``bindm``/``binde``/``bindl``/…) as
-    plain ``bind`` entries with boolean flags; this restores the original
-    ``bind_type`` so overrides round-trip correctly. For mouse binds the
-    runtime also reports ``dispatcher="mouse"`` with the real dispatcher in
-    ``arg``, which is unwound here so categorisation works.
-    """
-    if b.mouse:
-        bind_type = "bindm"
-    elif b.repeat:
-        bind_type = "binde"
-    elif b.locked:
-        bind_type = "bindl"
-    elif b.release:
-        bind_type = "bindr"
-    elif b.non_consuming:
-        bind_type = "bindn"
-    else:
-        bind_type = "bind"
-
-    # Hyprland's ``bindm`` IPC representation: ``dispatcher="mouse"`` with
-    # the real dispatcher (``movewindow``/``resizewindow``) in ``arg``.
-    if b.mouse and b.dispatcher == "mouse":
-        dispatcher = b.arg
-        arg = ""
-    else:
-        dispatcher = b.dispatcher
-        arg = b.arg
-
-    return BindData(
-        bind_type=bind_type,
-        mods=modmask_to_str(b.modmask).split(" + ") if b.modmask else [],
-        key=b.key,
-        dispatcher=dispatcher,
-        arg=arg,
-    )
-
-
-# ---------------------------------------------------------------------------
-# BindsPage
-# ---------------------------------------------------------------------------
 
 
 class BindsPage(SectionPage):
@@ -121,20 +77,25 @@ class BindsPage(SectionPage):
 
     def _load_binds(self, saved_sections=None):
         live_binds = self._window.hypr.get_binds() or []
-        all_hypr_binds = [_live_bind_to_data(b) for b in live_binds]
+        all_hypr_binds = [live_bind_to_data(b) for b in live_binds]
+        # Lua-mode IPC labels every bind ``__lua: <line>``; swap in real
+        # dispatcher info from the parsed source so categorisation and
+        # row labels match what the user actually configured.
+        all_hypr_binds = enrich_lua_binds(all_hypr_binds, self._window.hypr.document)
 
+        sections = saved_sections if saved_sections is not None else self._window.saved_sections
+        bind_lines = config.collect_bind_section(sections)
         parsed_binds: list[BindData] = []
-        if saved_sections is not None:
-            bind_lines = config.collect_bind_section(saved_sections)
-        else:
-            _, sections = config.read_all_sections()
-            bind_lines = config.collect_bind_section(sections)
         for line in bind_lines:
             parsed = parse_bind_line(line)
             if parsed:
                 parsed_binds.append(parsed)
 
-        self._overrides = OverrideTracker(all_hypr_binds, document=self._window.hypr.document)
+        self._overrides = OverrideTracker(
+            all_hypr_binds,
+            managed_path=config.managed_path(),
+            document=self._window.hypr.document,
+        )
         self._overrides.parse_saved_overrides(parsed_binds)
         self._owned_binds = SavedList(parsed_binds, key=lambda b: b.to_line())
 
@@ -259,22 +220,12 @@ class BindsPage(SectionPage):
 
         # Info note for locked binds
         if has_hypr_binds:
-            info_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-            info_box.set_margin_start(4)
-            info_icon = Gtk.Image.new_from_icon_name("dialog-information-symbolic")
-            info_icon.set_opacity(0.5)
-            info_icon.set_valign(Gtk.Align.CENTER)
-            info_box.append(info_icon)
-            info_label = Gtk.Label(
-                label="Locked keybinds come from your hyprland.conf. "
-                "Click the edit button to override them.",
+            self._content_box.append(
+                make_inline_hint(
+                    "Locked keybinds come from your hyprland.conf. "
+                    "Click the edit button to override them."
+                )
             )
-            info_label.set_wrap(True)
-            info_label.set_xalign(0)
-            info_label.add_css_class("dim-label")
-            info_label.add_css_class("caption")
-            info_box.append(info_label)
-            self._content_box.append(info_box)
 
         for cat in DISPATCHER_CATEGORIES:
             binds_in_cat = categories.get(cat["id"], [])
@@ -309,7 +260,7 @@ class BindsPage(SectionPage):
                         "Bind keys to launch apps, switch workspaces, or trigger "
                         "any Hyprland dispatcher."
                     ),
-                    icon_name="keyboard-shortcuts-symbolic",
+                    icon_name=BINDS_ICON,
                     primary_action=("Add Keybind…", self._on_add),
                 )
             )
@@ -559,3 +510,67 @@ class BindsPage(SectionPage):
 
     def get_bind_lines(self) -> list[str]:
         return self._overrides.get_bind_lines(self._owned_binds)  # type: ignore[arg-type]
+
+    # ── Pending changes ──
+
+    def iter_pending_changes(self) -> Iterator[PendingChange]:
+        if not self.is_dirty():
+            return
+        current_lines: set[str] = set()
+        for idx, bind in enumerate(self._owned_binds):
+            current_lines.add(bind.to_line())
+            baseline = self._owned_binds.get_baseline(idx)
+            if baseline is None:
+                shortcut = bind.format_shortcut() or "(no shortcut)"
+                yield PendingChange(
+                    category="Keybinds",
+                    title=shortcut,
+                    subtitle=f"new · {bind.format_action()}",
+                    kind="added",
+                    revert=lambda i=idx: self._discard_bind_at(i),
+                    navigate_to="binds",
+                    icon=BINDS_ICON,
+                )
+                continue
+            if not self._owned_binds.is_item_dirty(idx):
+                continue
+            old_shortcut = baseline.format_shortcut() or "(none)"
+            new_shortcut = bind.format_shortcut() or "(none)"
+            if old_shortcut == new_shortcut:
+                subtitle = f"{baseline.format_action()} → {bind.format_action()}"
+            else:
+                subtitle = f"{old_shortcut} → {new_shortcut}"
+            yield PendingChange(
+                category="Keybinds",
+                title=new_shortcut,
+                subtitle=subtitle,
+                kind="modified",
+                revert=lambda i=idx: self._discard_bind_at(i),
+                navigate_to="binds",
+                icon=BINDS_ICON,
+            )
+        for saved_bind in self._owned_binds.saved:
+            if saved_bind.to_line() not in current_lines:
+                shortcut = saved_bind.format_shortcut() or "(none)"
+                yield PendingChange(
+                    category="Keybinds",
+                    title=shortcut,
+                    subtitle=f"deleted · {saved_bind.format_action()}",
+                    kind="removed",
+                    revert=lambda b=saved_bind: self._restore_deleted(b),
+                    navigate_to="binds",
+                    icon=BINDS_ICON,
+                )
+
+    def _restore_deleted(self, bind: BindData) -> None:
+        """Re-insert a previously-deleted saved bind at its saved position.
+
+        Pushes a single undo entry, replays the bind to the running
+        compositor, and repaints the list — a pure delete-then-restore
+        round trip leaves the page non-dirty.
+        """
+        with self._undo_track():
+            self._apply_bind_live(bind)
+            self._owned_binds.restore_deleted(bind)
+        self._notify_dirty()
+        self._rebuild_list()

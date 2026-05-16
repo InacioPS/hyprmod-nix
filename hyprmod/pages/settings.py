@@ -24,13 +24,17 @@ class SettingsPage:
             description="Manage where HyprMod reads and writes Hyprland settings.",
         )
 
-        default_str = str(config.default_gui_conf())
+        default_str = str(config.default_managed_path())
         self._config_path_row = Adw.EntryRow(title="Config file path")
         self._config_path_row.set_text(self._window.config_path)
         self._config_path_row.set_show_apply_button(True)
         self._config_path_row.set_input_hints(Gtk.InputHints.NO_SPELLCHECK)
         self._config_path_row.set_tooltip_text(f"Default: {default_str}")
-        self._config_path_row.connect("apply", self._on_config_path_apply)
+        # Track the handler id so ``_reset_path_text`` can block it while
+        # programmatically resetting the entry — toggling
+        # ``set_show_apply_button`` to suppress the apply signal would
+        # work but is the boolean-flag anti-pattern.
+        self._apply_handler_id = self._config_path_row.connect("apply", self._on_config_path_apply)
 
         browse_btn = Gtk.Button(icon_name="document-open-symbolic")
         browse_btn.set_valign(Gtk.Align.CENTER)
@@ -64,17 +68,19 @@ class SettingsPage:
             self._auto_save_row.set_active(value)
 
     def _reset_path_text(self, text: str):
-        """Reset the entry text without re-arming the apply button."""
-        self._config_path_row.set_show_apply_button(False)
-        self._config_path_row.set_text(text)
-        self._config_path_row.set_show_apply_button(True)
+        """Reset the entry text without re-arming the apply signal."""
+        self._config_path_row.handler_block(self._apply_handler_id)
+        try:
+            self._config_path_row.set_text(text)
+        finally:
+            self._config_path_row.handler_unblock(self._apply_handler_id)
 
     # ── Callbacks ──
 
     def _apply_new_path(self, new_text: str, *, overwrite_confirmed: bool = False):
         """Validate and apply a new config file path."""
         new_path = Path(new_text).expanduser()
-        old_path = config.gui_conf()
+        old_path = config.managed_path()
 
         if new_path.resolve() == old_path.resolve():
             return
@@ -109,7 +115,7 @@ class SettingsPage:
     def _on_config_path_apply(self, row):
         text = row.get_text().strip()
         if not text:
-            text = str(config.default_gui_conf())
+            text = str(config.default_managed_path())
         if text != self._window.config_path:
             self._apply_new_path(text)
         self._reset_path_text(self._window.config_path)
@@ -137,9 +143,4 @@ class SettingsPage:
             self._reset_path_text(self._window.config_path)
 
     def _on_auto_save_toggled(self, row, _pspec):
-        new_val = row.get_active()
-        if new_val != self._window.auto_save:
-            self._window.auto_save = new_val
-            self._window._auto_save_action.set_state(GLib.Variant.new_boolean(new_val))
-            if new_val and self._window.has_dirty():
-                self._window._on_save()
+        self._window.set_auto_save(row.get_active())

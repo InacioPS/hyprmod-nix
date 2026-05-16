@@ -1,12 +1,42 @@
-"""Undo/redo stack manager for HyprMod."""
+"""Undo/redo stack manager for HyprMod.
 
+Each entry knows how to replay itself on the window (``apply(window, *,
+undo)``) so the window's redo/undo loop is a one-liner — no central
+dispatch table, no per-entry isinstance branches.
+"""
+
+from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from hyprland_socket import HyprlandError
+
+if TYPE_CHECKING:
+    from hyprmod.window import HyprModWindow
+
+
+class UndoEntry(ABC):
+    """Base class for all undo entries.
+
+    Subclasses implement :meth:`apply` to replay themselves on the window
+    in the requested direction. Returning ``False`` (e.g. the target page
+    doesn't exist or an IPC call failed) skips the confirm step so the
+    entry stays put for a retry.
+    """
+
+    @abstractmethod
+    def apply(self, window: "HyprModWindow", *, undo: bool) -> bool:
+        """Replay this entry on *window*.
+
+        Returns ``True`` when the apply succeeded and the entry should
+        move to the opposite stack; ``False`` when it should stay put
+        (page missing, IPC error already toasted, etc.).
+        """
 
 
 @dataclass(slots=True)
-class OptionChange:
+class OptionChange(UndoEntry):
     """Undo entry for a single option change."""
 
     key: str
@@ -15,18 +45,39 @@ class OptionChange:
     old_managed: bool = True
     new_managed: bool = True
 
+    def apply(self, window: "HyprModWindow", *, undo: bool) -> bool:
+        value = self.old_value if undo else self.new_value
+        managed = self.old_managed if undo else self.new_managed
+        try:
+            success = window.app_state.apply_option_value(self.key, value, managed)
+        except HyprlandError as e:
+            window.show_toast(f"Failed to set {self.key} — {e}", timeout=5)
+            return False
+        if success:
+            opt_row = window.option_rows.get(self.key)
+            if opt_row:
+                opt_row.set_value_silent(value)
+        return success
+
 
 @dataclass(slots=True)
-class AnimationUndoEntry:
+class AnimationUndoEntry(UndoEntry):
     """Undo entry for an animation state change."""
 
     anim_name: str
     anim_old: Any
     anim_new: Any
 
+    def apply(self, window: "HyprModWindow", *, undo: bool) -> bool:
+        page = window._animations_page
+        if page is None:
+            return False
+        page.restore_state(self.anim_name, self.anim_old if undo else self.anim_new)
+        return True
+
 
 @dataclass(slots=True)
-class CursorUndoEntry:
+class CursorUndoEntry(UndoEntry):
     """Undo entry for a cursor theme/size change."""
 
     old_theme: str
@@ -34,9 +85,19 @@ class CursorUndoEntry:
     new_theme: str
     new_size: int
 
+    def apply(self, window: "HyprModWindow", *, undo: bool) -> bool:
+        page = window._cursor_page
+        if page is None:
+            return False
+        page.restore_snapshot(
+            self.old_theme if undo else self.new_theme,
+            self.old_size if undo else self.new_size,
+        )
+        return True
+
 
 @dataclass(slots=True)
-class MonitorsUndoEntry:
+class MonitorsUndoEntry(UndoEntry):
     """Undo entry for a monitors snapshot."""
 
     old_monitors: list
@@ -44,9 +105,19 @@ class MonitorsUndoEntry:
     old_owned: set
     new_owned: set
 
+    def apply(self, window: "HyprModWindow", *, undo: bool) -> bool:
+        page = window._monitors_page
+        if page is None:
+            return False
+        page.restore_snapshot(
+            self.old_monitors if undo else self.new_monitors,
+            self.old_owned if undo else self.new_owned,
+        )
+        return True
+
 
 @dataclass(slots=True)
-class SavedListSnapshot:
+class SavedListSnapshot(UndoEntry):
     """Undo entry for any ``SavedList[T]``-backed page.
 
     Used by autostart, env-vars, window-rules, and layer-rules. Each
@@ -65,9 +136,19 @@ class SavedListSnapshot:
     old_baselines: list
     new_baselines: list
 
+    def apply(self, window: "HyprModWindow", *, undo: bool) -> bool:
+        page = getattr(window, self.page_attr, None)
+        if page is None:
+            return False
+        page.restore_snapshot(
+            self.old_items if undo else self.new_items,
+            self.old_baselines if undo else self.new_baselines,
+        )
+        return True
+
 
 @dataclass(slots=True)
-class BindsUndoEntry:
+class BindsUndoEntry(UndoEntry):
     """Undo entry for a keybinds snapshot.
 
     Distinct from :class:`SavedListSnapshot` because binds also track a
@@ -81,15 +162,16 @@ class BindsUndoEntry:
     old_session_overrides: dict
     new_session_overrides: dict
 
-
-type UndoEntry = (
-    OptionChange
-    | AnimationUndoEntry
-    | CursorUndoEntry
-    | MonitorsUndoEntry
-    | BindsUndoEntry
-    | SavedListSnapshot
-)
+    def apply(self, window: "HyprModWindow", *, undo: bool) -> bool:
+        page = window._binds_page
+        if page is None:
+            return False
+        page.restore_snapshot(
+            self.old_items if undo else self.new_items,
+            self.old_baselines if undo else self.new_baselines,
+            self.old_session_overrides if undo else self.new_session_overrides,
+        )
+        return True
 
 
 class UndoManager:

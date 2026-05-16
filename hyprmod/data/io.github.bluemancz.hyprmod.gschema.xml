@@ -11,5 +11,10 @@
       <summary>Config file path</summary>
       <description>Path to the HyprMod managed config file. Empty string uses the default location (~/.config/hypr/hyprland-gui.conf).</description>
     </key>
+    <key name="lua-migration-banner-dismissed" type="b">
+      <default>false</default>
+      <summary>Hide the Lua migration banner</summary>
+      <description>When true, the main-window banner that prompts users on Hyprland 0.55+ to migrate from hyprland.conf to hyprland.lua is suppressed. Set automatically when the user dismisses or completes the migration.</description>
+    </key>
   </schema>
 </schemalist>

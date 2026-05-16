@@ -28,9 +28,8 @@ with the Cursor page's lines first by convention.
 from dataclasses import dataclass
 from pathlib import Path
 
-import hyprland_config
-
 from hyprmod.core import config
+from hyprmod.core.external import load_external_keyword_entries
 
 # Names whose env lines are owned by ``hyprmod.pages.cursor.CursorPage``.
 # The Env Variables page skips these on read so the cursor theme/size is
@@ -180,18 +179,15 @@ def load_external_env_vars(
     Errors return an empty list (advisory display only; failing
     silently is safer than blocking the page on a flaky config).
     """
-    if not root_path.exists():
-        return []
-    try:
-        doc = hyprland_config.load(root_path, follow_sources=True, lenient=True)
-    except (OSError, hyprland_config.ParseError, hyprland_config.SourceCycleError):
-        return []
-
-    managed_str = str(managed_path)
+    # Env lines need no schema migration pass; we parse ``env = NAME,value``
+    # directly and then apply cursor-owned-name filtering.
+    entries = load_external_keyword_entries(
+        root_path,
+        managed_path,
+        (config.KEYWORD_ENV,),
+    )
     external: list[ExternalEnvVar] = []
-    for entry in doc.find_all(config.KEYWORD_ENV):
-        if entry.source_name == managed_str:
-            continue
+    for entry in entries:
         line = f"{entry.key} = {entry.value}"
         parsed = parse_env_line(line)
         if parsed is None:
@@ -204,7 +200,7 @@ def load_external_env_vars(
         external.append(
             ExternalEnvVar(
                 var=parsed,
-                source_path=Path(entry.source_name),
+                source_path=entry.source_path,
                 lineno=entry.lineno,
             )
         )

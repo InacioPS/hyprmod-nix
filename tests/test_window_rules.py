@@ -20,6 +20,7 @@ import re
 from pathlib import Path
 
 import pytest
+from hyprland_config import V3_BOOL_EFFECTS
 from hyprland_socket import Window
 
 from hyprmod.core.change_tracking import (
@@ -32,10 +33,8 @@ from hyprmod.core.window_rules import (
     ACTION_PRESETS_BY_ID,
     CUSTOM_PRESET,
     HYPRMOD_APP_ID,
-    KEYWORD_WRITE,
     RAW_KEY,
     RETROACTIVE_EFFECTS,
-    V3_BOOL_EFFECTS,
     ExternalWindowRule,
     Matcher,
     WindowRule,
@@ -141,7 +140,9 @@ class TestReadPathMigratesV2:
             "windowrulev2 = float, class:^(firefox)$\n"
             "windowrulev2 = noblur, initialClass:^(kitty)$\n"
         )
-        monkeypatch.setattr(core_config, "_DEFAULT_GUI_CONF", conf)
+        monkeypatch.setattr(core_config, "_DEFAULT_MANAGED_BASE", conf.with_suffix(""))
+        # Force Hyprlang mode so managed_path() resolves to ``conf``.
+        monkeypatch.setattr("hyprland_config.default_config_dir", lambda: tmp_path)
 
         _, sections = core_config.read_all_sections()
         # All entries land under the v3 keyword after migration; the
@@ -160,7 +161,9 @@ class TestReadPathMigratesV2:
 
         conf = tmp_path / "hyprland-gui.conf"
         conf.write_text(r"windowrulev2 = match:class ^(foo)$, title:float on" + "\n")
-        monkeypatch.setattr(core_config, "_DEFAULT_GUI_CONF", conf)
+        monkeypatch.setattr(core_config, "_DEFAULT_MANAGED_BASE", conf.with_suffix(""))
+        # Force Hyprlang mode so managed_path() resolves to ``conf``.
+        monkeypatch.setattr("hyprland_config.default_config_dir", lambda: tmp_path)
 
         _, sections = core_config.read_all_sections()
         v3_lines = sections.get("windowrule", [])
@@ -504,14 +507,18 @@ class TestCountPendingChanges:
 
 
 # ---------------------------------------------------------------------------
-# Smoke test: KEYWORD_WRITE is the v3 keyword
+# Smoke test: the write keyword is the v3 form
 # ---------------------------------------------------------------------------
 
 
-def test_keyword_write_is_v3():
+def test_write_keyword_is_v3():
     # Hyprland 0.53+ rejects ``windowrulev2``. Anything we write must
     # use the v3 keyword.
-    assert KEYWORD_WRITE == "windowrule"
+    from hyprmod.core import config
+
+    rule = WindowRule(matchers=[Matcher(key="class", value="kitty")], effect_name="float")
+    assert rule.to_line().startswith(f"{config.KEYWORD_WINDOWRULE} = ")
+    assert config.KEYWORD_WINDOWRULE == "windowrule"
 
 
 # ---------------------------------------------------------------------------

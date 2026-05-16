@@ -3,12 +3,26 @@
 import functools
 from collections.abc import Callable
 from pathlib import Path
-from typing import cast
+from typing import Protocol, cast
 
 from gi.repository import Adw, Gdk, Gtk, Pango
+from hyprland_config import keyword_to_lua
 
+from hyprmod.core import config
 from hyprmod.ui.options import OptionRow, create_option_row  # noqa: F401
 from hyprmod.ui.row_actions import RowActions  # noqa: F401
+
+
+class ShowToast(Protocol):
+    """Callable shape of :meth:`HyprModWindow.show_toast`.
+
+    Captured as a Protocol so helpers that take a toast function as a
+    dependency (``try_with_toast``, controller injections) keep a typed
+    contract instead of falling back to ``Callable[..., object]``.
+    """
+
+    def __call__(self, message: str, timeout: int = ...) -> None: ...
+
 
 # Fallback accent colors used in Cairo drawing (bezier canvas, monitor preview).
 # These are used when the widget can't resolve the GTK accent color from CSS.
@@ -104,7 +118,7 @@ def confirm(
 
 
 def try_with_toast(
-    show_toast: Callable[..., object],
+    show_toast: ShowToast,
     error_prefix: str,
     action: Callable[[], object],
     *,
@@ -137,8 +151,25 @@ def try_with_toast(
     return True
 
 
+def format_config_preview(keyword: str, body: str) -> str:
+    """Render a config-line preview in the active mode's syntax.
+
+    Lua mode returns the ``hl.*(...)`` snippet that hyprmod will actually
+    write (matching what hits disk byte-for-byte). Hyprlang mode returns
+    the canonical ``key = value`` line. Falls back to the Hyprlang form
+    when *keyword* has no Lua emitter, so previews stay populated for
+    keywords that aren't yet translatable.
+    """
+    if config.is_lua_mode():
+        try:
+            return keyword_to_lua(keyword, body)
+        except ValueError:
+            pass
+    return f"{keyword} = {body}"
+
+
 def build_preview_group(
-    description: str = "This is the exact line that will be written to your HyprMod config.",
+    description: str = "This is what HyprMod will write to your config file.",
 ) -> tuple[Adw.PreferencesGroup, Gtk.Label]:
     """Build a labelled "Preview" group containing a monospace label.
 

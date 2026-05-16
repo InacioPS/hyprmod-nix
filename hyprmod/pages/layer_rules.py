@@ -44,14 +44,12 @@ release. Layer rule order is less critical than window rule order
 """
 
 from html import escape as html_escape
-from pathlib import Path
 
-from gi.repository import Adw, GLib, Gtk
+from gi.repository import Adw, Gtk
 from hyprland_socket import HyprlandError
 
 from hyprmod.core import config
 from hyprmod.core.layer_rules import (
-    KEYWORD_WRITE,
     LAYER_RULE_KEYWORDS,
     ExternalLayerRule,
     LayerRule,
@@ -61,23 +59,31 @@ from hyprmod.core.layer_rules import (
     summarize_rule,
 )
 from hyprmod.core.ownership import SavedList
-from hyprmod.core.setup import HYPRLAND_CONF
-from hyprmod.core.undo import SavedListSnapshot
 from hyprmod.pages.section import SavedListSectionPage
 from hyprmod.ui import (
-    clear_children,
-    display_path,
     make_inline_hint,
     make_page_layout,
     try_with_toast,
 )
 from hyprmod.ui.empty_state import EmptyState
+from hyprmod.ui.icons import LAYER_RULES_ICON
 from hyprmod.ui.layer_rule_dialog import LayerRuleEditDialog
 from hyprmod.ui.row_actions import RowActions
 
 
 class LayerRulesPage(SavedListSectionPage[LayerRule]):
     """List editor for ``layerrule`` entries."""
+
+    _unit_singular = "rule"
+    _unit_plural = "rules"
+    _deleted_subtitle_lines = 2
+    _page_attr = "_layer_rules_page"
+    _pending_category = "Layer Rules"
+    _pending_navigate_to = "layer_rules"
+    _pending_icon = LAYER_RULES_ICON
+    _group_title = "Layer Rules"
+    _group_add_tooltip = "Add another rule"
+    _external_prefix_icon = LAYER_RULES_ICON
 
     def __init__(
         self,
@@ -90,65 +96,24 @@ class LayerRulesPage(SavedListSectionPage[LayerRule]):
         self._content_box: Gtk.Box
         self._scrolled: Gtk.ScrolledWindow
         self._owned: SavedList[LayerRule]
-        # Layer rules from sourced config files outside our managed file —
-        # surfaced read-only so users see the full picture. Rebuilt on
-        # every load (including profile switches), since their content
-        # can change without our involvement.
-        self._external: list[ExternalLayerRule] = []
-        # Maps each owned-list index to the row widget representing it.
-        # Same shape as window_rules / autostart — pre-sized to ``None``
-        # and filled in as ``_make_row`` runs. Used by the keyboard
-        # reorder path to refocus the moved row post-rebuild.
-        self._rows_by_idx: list[Adw.ActionRow | None] = []
         self._load(saved_sections)
 
     # ── Loading ──
 
     def _load(self, saved_sections: dict[str, list[str]] | None) -> None:
         if saved_sections is None:
-            _, saved_sections = config.read_all_sections()
+            saved_sections = self._window.saved_sections
         raw_lines = config.collect_section(saved_sections, *LAYER_RULE_KEYWORDS)
         items = parse_layer_rule_lines(raw_lines)
         self._owned = SavedList(items, key=lambda r: r.to_line())
-        self._external = load_external_layer_rules(HYPRLAND_CONF, config.gui_conf())
+        self._external = load_external_layer_rules(config.user_entry_path(), config.managed_path())
 
-    # ── Undo / Redo ──
-
-    def _capture_undo(self):
-        return self._owned.snapshot()
-
-    def _undo_key(self) -> list[str]:
-        return [r.to_line() for r in self._owned]
-
-    def _build_undo_entry(self, old, new):
-        old_items, old_baselines = old
-        new_items, new_baselines = new
-        return SavedListSnapshot(
-            page_attr="_layer_rules_page",
-            old_items=old_items,
-            new_items=new_items,
-            old_baselines=old_baselines,
-            new_baselines=new_baselines,
-        )
-
-    def restore_snapshot(
-        self,
-        items: list[LayerRule],
-        baselines: list[LayerRule | None],
-    ) -> None:
-        """Restore state from an undo/redo snapshot.
-
-        Unlike the window-rules version, no per-surface runtime sync is
-        needed: Hyprland reads dynamic layer rules every frame, so the
-        running compositor reflects whatever's in its in-memory
-        windowrule list at the next frame regardless of how it got there.
-        Save+reload still produces the canonical state (and is what
-        *removes* a rule from the running compositor — there's no
-        ``unlayerrule`` IPC).
-        """
-        self._owned.restore(items, baselines)
-        self._rebuild_list()
-        self._notify_dirty()
+    # Restore-snapshot default applies: layer rules need no per-surface
+    # runtime sync. Hyprland reads dynamic layer rules every frame, so the
+    # running compositor reflects the in-memory rule list at the next frame
+    # regardless of how it got there. Save+reload still produces the
+    # canonical state (and is what *removes* a rule from the running
+    # compositor — there's no ``unlayerrule`` IPC).
 
     # ── Build ──
 
@@ -167,40 +132,6 @@ class LayerRulesPage(SavedListSectionPage[LayerRule]):
 
     # ── List rendering ──
 
-    def _rebuild_list(self, focus_idx: int = -1) -> None:
-        clear_children(self._content_box)
-        self._rows_by_idx = [None] * len(self._owned)
-
-        # Reorder hint shown only when there are at least two entries.
-        if len(self._owned) >= 2:
-            self._content_box.append(self._build_order_hint())
-
-        if len(self._owned) > 0:
-            self._content_box.append(self._build_group())
-
-        # Surface deleted rules so the user can restore them before save.
-        deleted = self._deleted_baselines()
-        if deleted:
-            self._content_box.append(self._build_deleted_group(deleted))
-
-        # External rules from the user's hyprland.conf or sourced files —
-        # read-only display with source-path provenance. Always at the
-        # bottom: it's reference info, not the primary content.
-        if self._external:
-            for widget in self._build_external_section():
-                self._content_box.append(widget)
-
-        if len(self._owned) == 0 and not deleted and not self._external:
-            self._content_box.append(self._build_empty_state())
-
-        if 0 <= focus_idx < len(self._rows_by_idx):
-            target = self._rows_by_idx[focus_idx]
-            if target is not None:
-                # Defer to idle so the row is mapped before grab_focus
-                # (see ``_grab_focus_once`` in the base class for the
-                # SOURCE_REMOVE rationale).
-                GLib.idle_add(self._grab_focus_once, target)
-
     def _build_empty_state(self) -> EmptyState:
         """Empty-state page with a single "Add Rule" button.
 
@@ -216,7 +147,7 @@ class LayerRulesPage(SavedListSectionPage[LayerRule]):
                 "Tweak how shell surfaces (waybar, notifications, rofi, wallpapers) "
                 "are decorated — backdrop blur, dim-around, animations, render order."
             ),
-            icon_name="overlapping-windows-symbolic",
+            icon_name=LAYER_RULES_ICON,
             primary_action=("Add Rule…", self._on_add),
         )
 
@@ -228,69 +159,24 @@ class LayerRulesPage(SavedListSectionPage[LayerRule]):
             "Reorder with Alt+↑ / Alt+↓ on a focused row."
         )
 
-    def _build_group(self) -> Adw.PreferencesGroup:
-        group = Adw.PreferencesGroup(title="Layer Rules")
-        n = len(self._owned)
-        group.set_description(f"{n} rule{'' if n == 1 else 's'}")
+    # Group + deleted-row + external-section rendering uses the base
+    # ``SavedListSectionPage`` template; only the per-row content is
+    # page-specific.
 
-        # Header-suffix add button mirrors the page-header one for users
-        # who scrolled past the page header.
-        add_btn = Gtk.Button(icon_name="list-add-symbolic")
-        add_btn.set_valign(Gtk.Align.CENTER)
-        add_btn.add_css_class("flat")
-        add_btn.set_tooltip_text("Add another rule")
-        add_btn.connect("clicked", lambda _b: self._on_add())
-        group.set_header_suffix(add_btn)
+    def _deleted_row_summary(self, item: LayerRule) -> tuple[str, str]:
+        return summarize_rule(item)
 
-        for idx in range(len(self._owned)):
-            group.add(self._make_row(idx, self._owned[idx]))
-        return group
+    # ── Pending-changes summarizers ──
 
-    def _build_deleted_group(self, deleted: list[LayerRule]) -> Adw.PreferencesGroup:
-        group = Adw.PreferencesGroup(title="Removed (pending save)")
-        group.set_description(
-            f"{len(deleted)} rule{'' if len(deleted) == 1 else 's'} will be removed on save"
-        )
-        for item in deleted:
-            title, subtitle = summarize_rule(item)
-            row = Adw.ActionRow(
-                title=html_escape(title),
-                subtitle=html_escape(subtitle),
-            )
-            row.set_title_lines(1)
-            row.set_subtitle_lines(2)
-            row.add_css_class("option-default")
-            row.set_opacity(0.65)
+    def _summarize_item(self, item: LayerRule) -> tuple[str, str]:
+        return summarize_rule(item)
 
-            restore_btn = Gtk.Button(icon_name="edit-undo-symbolic")
-            restore_btn.set_valign(Gtk.Align.CENTER)
-            restore_btn.add_css_class("flat")
-            restore_btn.set_tooltip_text("Restore this rule")
-            restore_btn.connect("clicked", lambda _b, e=item: self._on_restore_deleted(e))
-            row.add_suffix(restore_btn)
-
-            group.add(row)
-        return group
-
-    def _build_external_section(self) -> list[Gtk.Widget]:
-        """Build the read-only external-rules display.
-
-        Returns an inline hint + one PreferencesGroup per source file —
-        same grouping pattern as the window-rules page so users see one
-        path-as-title per file instead of repeating it on every row.
-        """
-        widgets: list[Gtk.Widget] = [self._build_external_hint()]
-
-        # ``find_all`` returns rules in source-traversal order, so a
-        # plain (insertion-ordered) dict gives us the right grouping
-        # for free.
-        by_file: dict[Path, list[ExternalLayerRule]] = {}
-        for ext in self._external:
-            by_file.setdefault(ext.source_path, []).append(ext)
-
-        for source_path, rules in by_file.items():
-            widgets.append(self._build_external_file_group(source_path, rules))
-        return widgets
+    def _summarize_modified(self, baseline: LayerRule, item: LayerRule) -> tuple[str, str]:
+        old_title, old_subtitle = summarize_rule(baseline)
+        new_title, new_subtitle = summarize_rule(item)
+        if old_title != new_title:
+            return new_title, f"{old_title} → {new_title}"
+        return new_title, f"{old_subtitle} → {new_subtitle}"
 
     def _build_external_hint(self) -> Gtk.Widget:
         """Inline note explaining that the rules below are read-only."""
@@ -301,47 +187,16 @@ class LayerRulesPage(SavedListSectionPage[LayerRule]):
             icon_name="changes-prevent-symbolic",
         )
 
-    def _build_external_file_group(
-        self, source_path: Path, rules: list[ExternalLayerRule]
-    ) -> Adw.PreferencesGroup:
-        """A PreferencesGroup containing every external rule from one file."""
-        group = Adw.PreferencesGroup(title=display_path(source_path))
-        n = len(rules)
-        group.set_description(f"{n} rule{'' if n == 1 else 's'}")
-        for ext in rules:
-            group.add(self._make_external_row(ext))
-        return group
-
     def _make_external_row(self, ext: ExternalLayerRule) -> Adw.ActionRow:
         title, namespace_summary = summarize_rule(ext.rule)
-        # Subtitle = namespace summary + line number. Path is in the
-        # group title above; middle dot mirrors the window-rules page.
-        subtitle = f"{namespace_summary}  ·  line {ext.lineno}"
-
-        row = Adw.ActionRow(
-            title=html_escape(title),
-            subtitle=html_escape(subtitle),
+        # No "override" action: Hyprland has no ``unlayerrule`` IPC, same
+        # caveat as window rules. Lock-icon-only suffix mirrors that page.
+        return self._make_readonly_external_row(
+            title=title,
+            subtitle=f"{namespace_summary}  ·  line {ext.lineno}",
+            source_path=ext.source_path,
+            lineno=ext.lineno,
         )
-        row.set_title_lines(1)
-        row.set_subtitle_lines(1)
-        row.add_css_class("option-default")
-        row.set_opacity(0.65)
-        row.set_tooltip_text(f"{ext.source_path}:{ext.lineno}")
-
-        prefix = Gtk.Image.new_from_icon_name("overlapping-windows-symbolic")
-        prefix.set_opacity(0.4)
-        prefix.set_pixel_size(28)
-        row.add_prefix(prefix)
-
-        # Lock icon as the only suffix — same pattern the window-rules
-        # page uses for read-only entries. No "override" action because
-        # Hyprland has no ``unlayerrule`` IPC.
-        lock_icon = Gtk.Image.new_from_icon_name("changes-prevent-symbolic")
-        lock_icon.set_opacity(0.4)
-        lock_icon.set_valign(Gtk.Align.CENTER)
-        row.add_suffix(lock_icon)
-
-        return row
 
     def _make_row(self, idx: int, item: LayerRule) -> Adw.ActionRow:
         title, subtitle = summarize_rule(item)
@@ -354,7 +209,7 @@ class LayerRulesPage(SavedListSectionPage[LayerRule]):
         # ellipsized into uselessness.
         row.set_subtitle_lines(2)
 
-        prefix = Gtk.Image.new_from_icon_name("overlapping-windows-symbolic")
+        prefix = Gtk.Image.new_from_icon_name(LAYER_RULES_ICON)
         prefix.set_opacity(0.6)
         prefix.set_pixel_size(28)
         row.add_prefix(prefix)
@@ -400,25 +255,9 @@ class LayerRulesPage(SavedListSectionPage[LayerRule]):
         return try_with_toast(
             self._window.show_toast,
             "Layer rule failed",
-            lambda: self._window.hypr.keyword(KEYWORD_WRITE, rule.body()),
+            lambda: self._window.hypr.keyword(config.KEYWORD_LAYERRULE, rule.body()),
             catch=HyprlandError,
         )
-
-    # ── Commit helpers (mutate SavedList + repaint) ──
-
-    def _commit_appended(self, rule: LayerRule) -> None:
-        """Add *rule* to the owned list as a new entry."""
-        with self._undo_track():
-            self._owned.append_new(rule)
-        self._notify_dirty()
-        self._rebuild_list()
-
-    def _commit_replaced(self, idx: int, rule: LayerRule) -> None:
-        """Replace the owned entry at *idx* with *rule*."""
-        with self._undo_track():
-            self._owned[idx] = rule
-        self._notify_dirty()
-        self._rebuild_list()
 
     # ── Add / Edit / Remove ──
 
@@ -442,48 +281,31 @@ class LayerRulesPage(SavedListSectionPage[LayerRule]):
 
         LayerRuleEditDialog.present_singleton(self._window, rule=current, on_apply=on_apply)
 
-    def _on_delete_at(self, idx: int) -> None:
-        # Hyprland has no ``unlayerrule`` IPC, so the rule itself stays
-        # in the runtime list until the next reload — surfaces mapped
-        # *after* this delete still see it. Save+reload is the escape
-        # hatch.
-        if idx < 0 or idx >= len(self._owned):
-            return
-        with self._undo_track():
-            self._owned.pop_at(idx)
-        self._notify_dirty()
-        self._rebuild_list()
+    # ``_on_delete_at`` uses the base default — Hyprland has no
+    # ``unlayerrule`` IPC, so the rule stays in the runtime list until
+    # the next reload (surfaces mapped *after* this delete still see it).
+    # Save+reload is the escape hatch.
 
     def _discard_at(self, idx: int) -> None:
-        """Revert a single rule to its saved value (or remove if unsaved)."""
+        """Revert a single rule to its saved value, re-pushing it live.
+
+        Re-push so the running compositor reflects the restored value
+        for any *new* surfaces. (Existing surfaces picked up the dirty
+        version while it was active; their state reverts automatically
+        on next frame for dynamic rules.)
+        """
         baseline = self._owned.get_baseline(idx)
-        if baseline is None:
-            self._on_delete_at(idx)
-            return
-        with self._undo_track():
-            self._owned.discard_at(idx)
-        # Re-push the baseline so the running compositor reflects the
-        # restored value for any *new* surfaces. (Existing surfaces
-        # picked up the dirty version while it was active; their state
-        # reverts automatically on next frame for dynamic rules.)
-        self._apply_rule_live(baseline)
-        self._notify_dirty()
-        self._rebuild_list()
+        super()._discard_at(idx)
+        if baseline is not None:
+            self._apply_rule_live(baseline)
 
     def _on_restore_deleted(self, item: LayerRule) -> None:
-        """Restore a previously-deleted rule to its saved position.
+        """Restore a previously-deleted rule, re-pushing it to the compositor.
 
-        Routes through :meth:`SavedList.restore_deleted` so the row
-        comes back with its saved baseline at the slot consistent with
-        the saved order — a pure delete-then-restore round trip leaves
-        the page non-dirty. The rule is also re-pushed to the running
-        compositor so dynamic effects (blur, dim, ignorealpha) take
-        effect again on the next frame.
+        Dynamic effects (blur, dim, ignorealpha) take effect again on
+        the next frame after the keyword push.
         """
-        with self._undo_track():
-            self._owned.restore_deleted(item)
-        self._notify_dirty()
-        self._rebuild_list()
+        super()._on_restore_deleted(item)
         self._apply_rule_live(item)
 
     # ── Save plumbing ──

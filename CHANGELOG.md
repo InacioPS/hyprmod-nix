@@ -9,11 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Lua config support — read and edit `hyprland.lua` directly, with live preview against Hyprland 0.55+'s Lua runtime
+- "Migrate to Lua…" wizard and main-window banner (Hyprland 0.55+) — converts your active `hyprland.conf` to `hyprland.lua`, rewrites the entrypoint include, and is dismissible
 - Per-monitor "Identify by description" toggle — emits `monitor=desc:…` instead of `monitor=DP-1, …` so the saved configuration follows the physical monitor across port changes (#26)
 
 ### Changed
 
 - Bind dialog's Manual Edit modifier picker is a compact two-row chip strip instead of stacked switch rows
+- Options unavailable on the running Hyprland version are hidden instead of greyed-out; group headers collapse when every row in the group is unavailable
+- Profiles transcode on activation — saving in Hyprlang then activating in Lua (or vice-versa) just works
 
 ### Fixed
 

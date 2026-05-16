@@ -1,5 +1,6 @@
 """Animation configuration page — flat list with detail dialogs."""
 
+from collections.abc import Iterator
 from dataclasses import replace
 
 from gi.repository import Adw, GLib, Gtk
@@ -13,10 +14,12 @@ from hyprland_state import (
 
 from hyprmod.core import config
 from hyprmod.core.ownership import OwnershipSet
+from hyprmod.core.pending import ChangeKind, PendingChange
 from hyprmod.core.undo import AnimationUndoEntry
 from hyprmod.data.bezier_data import get_curve_store
 from hyprmod.pages.section import SectionPage
 from hyprmod.ui.bezier_editor import BezierEditorDialog
+from hyprmod.ui.icons import ANIMATIONS_ICON
 from hyprmod.ui.row_actions import RowActions
 from hyprmod.ui.signals import SignalBlocker
 
@@ -147,11 +150,8 @@ class AnimationsPage(SectionPage):
 
     def load_owned_names(self, saved_sections=None):
         """Load which animation names HyprMod owns from the config file."""
-        if saved_sections is not None:
-            saved_lines = config.collect_section(saved_sections, config.KEYWORD_ANIMATION)
-        else:
-            _, sections = config.read_all_sections()
-            saved_lines = config.collect_section(sections, config.KEYWORD_ANIMATION)
+        sections = saved_sections if saved_sections is not None else self._window.saved_sections
+        saved_lines = config.collect_section(sections, config.KEYWORD_ANIMATION)
         names: set[str] = set()
         for line in saved_lines:
             _, _, val = line.partition("=")
@@ -296,7 +296,7 @@ class AnimationsPage(SectionPage):
         either a user-defined override from their own config or the
         inherited value from the parent animation chain.
         """
-        fallback = self._anims.get_fallback(name, config.gui_conf())
+        fallback = self._anims.get_fallback(name, config.managed_path())
         if fallback:
             # User has their own animation line — apply it
             self._apply_with_curves(fallback)
@@ -373,6 +373,58 @@ class AnimationsPage(SectionPage):
         for name in ANIM_LOOKUP:
             self._refresh_row(name)
         self._notify_dirty()
+
+    # ── Pending changes ──
+
+    def iter_pending_changes(self) -> Iterator[PendingChange]:
+        if not self.is_dirty():
+            return
+        for name, *_ in ANIM_FLAT:
+            if name not in ANIM_LOOKUP or not self.is_anim_dirty(name):
+                continue
+            current = self._anims.get_cached(name)
+            baseline = self._anims.get_baseline(name)
+            kind, subtitle = self._describe_change(name, baseline, current)
+            yield PendingChange(
+                category="Animations",
+                title=ANIM_LABELS.get(name, name),
+                subtitle=subtitle,
+                kind=kind,
+                revert=lambda n=name: self.revert_anim(n),
+                navigate_to="animations",
+                icon=ANIMATIONS_ICON,
+            )
+
+    def _describe_change(
+        self,
+        name: str,
+        baseline: AnimState | None,
+        current: AnimState | None,
+    ) -> tuple[ChangeKind, str]:
+        was_owned = self._ownership.is_saved(name)
+        is_owned = self._ownership.is_owned(name)
+        # Pure ownership flips
+        if was_owned and not is_owned:
+            return "removed", "remove override on save"
+        if not was_owned and is_owned and (baseline is None or not baseline.overridden):
+            return "added", "new override"
+
+        # Field-level diff between baseline and current
+        if baseline is None or current is None:
+            return "modified", "updated"
+
+        diffs: list[str] = []
+        if baseline.enabled != current.enabled:
+            diffs.append(
+                f"{'on' if baseline.enabled else 'off'} → {'on' if current.enabled else 'off'}"
+            )
+        if abs(baseline.speed - current.speed) > 1e-6:
+            diffs.append(f"speed {baseline.speed:g} → {current.speed:g}")
+        if (baseline.curve or "") != (current.curve or ""):
+            diffs.append(f"curve {baseline.curve or '—'} → {current.curve or '—'}")
+        if (baseline.style or "") != (current.style or ""):
+            diffs.append(f"style {baseline.style or '—'} → {current.style or '—'}")
+        return "modified", " · ".join(diffs) if diffs else "updated"
 
     # -- UI building --
 

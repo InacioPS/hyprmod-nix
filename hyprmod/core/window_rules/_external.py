@@ -10,8 +10,7 @@ point users at the file they need to edit by hand.
 from dataclasses import dataclass
 from pathlib import Path
 
-import hyprland_config
-
+from hyprmod.core.external import load_external_keyword_entries
 from hyprmod.core.window_rules._model import WINDOW_RULE_KEYWORDS, WindowRule
 from hyprmod.core.window_rules._parse import parse_window_rule_line
 
@@ -52,35 +51,26 @@ def load_external_window_rules(
     so failing silently is safer than blocking the page on a flaky
     config.
     """
-    if not root_path.exists():
-        return []
-    try:
-        doc = hyprland_config.load(root_path, follow_sources=True, lenient=True)
-    except (OSError, hyprland_config.ParseError, hyprland_config.SourceCycleError):
-        return []
+    # Window rules have legacy spellings that should display in normalized v3
+    # form; migrate the in-memory document before keyword extraction.
+    entries = load_external_keyword_entries(
+        root_path,
+        managed_path,
+        WINDOW_RULE_KEYWORDS,
+        migrate_doc=True,
+    )
 
-    # Rewrite v1/v2 windowrule lines to v3 in-memory before walking,
-    # so the parser only ever sees the current syntax. This mutates
-    # the in-memory Document but never touches disk — the user's
-    # source files are unchanged; the migration is just a normalised
-    # view for our display.
-    hyprland_config.migrate(doc)
-
-    managed_str = str(managed_path)
     external: list[ExternalWindowRule] = []
-    for keyword in WINDOW_RULE_KEYWORDS:
-        for entry in doc.find_all(keyword):
-            if entry.source_name == managed_str:
-                continue
-            line = f"{entry.key} = {entry.value}"
-            rule = parse_window_rule_line(line)
-            if rule is None:
-                continue
-            external.append(
-                ExternalWindowRule(
-                    rule=rule,
-                    source_path=Path(entry.source_name),
-                    lineno=entry.lineno,
-                )
+    for entry in entries:
+        line = f"{entry.key} = {entry.value}"
+        rule = parse_window_rule_line(line)
+        if rule is None:
+            continue
+        external.append(
+            ExternalWindowRule(
+                rule=rule,
+                source_path=entry.source_path,
+                lineno=entry.lineno,
             )
+        )
     return external

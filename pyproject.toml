@@ -1,16 +1,16 @@
 [project]
 name = "hyprmod"
-version = "0.2.0"
+version = "0.3.0"
 description = "A native GTK4/libadwaita settings app for Hyprland"
 license = "GPL-3.0-or-later"
 requires-python = ">=3.12"
 dependencies = [
     "pygobject>=3.56.2",
-    "hyprland-config>=0.4.5",
-    "hyprland-schema>=0.4.0",
-    "hyprland-state>=0.2.1",
+    "hyprland-config>=0.6.1",
+    "hyprland-schema>=0.6.1",
+    "hyprland-state>=0.4.0",
     "hyprland-monitors>=0.5.0",
-    "hyprland-socket>=0.10.0",
+    "hyprland-socket>=0.12.1",
 ]
 
 [dependency-groups]

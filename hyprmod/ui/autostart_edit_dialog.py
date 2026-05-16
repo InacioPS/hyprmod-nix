@@ -47,7 +47,7 @@ class AutostartEditDialog(SingletonDialogMixin, Adw.Dialog):
 
         self.set_title("Add Autostart Entry" if self._is_new else "Edit Autostart Entry")
         self.set_content_width(520)
-        self.set_follows_content_size(True)
+        self.set_content_height(360)
 
         toolbar = Adw.ToolbarView()
 

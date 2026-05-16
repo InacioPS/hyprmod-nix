@@ -29,17 +29,18 @@ so the dialog can always assume single-effect editing.
 from collections.abc import Callable
 
 from gi.repository import Adw, Gtk
+from hyprland_config import LAYER_BOOL_EFFECTS
 
+from hyprmod.core import config
 from hyprmod.core.layer_rules import (
     CUSTOM_PRESET,
     LAYER_ACTION_PRESETS,
-    LAYER_BOOL_EFFECTS,
     LayerActionField,
     LayerActionPreset,
     LayerRule,
     lookup_preset,
 )
-from hyprmod.ui import build_preview_group
+from hyprmod.ui import build_preview_group, format_config_preview
 from hyprmod.ui.dialog import SingletonDialogMixin
 
 
@@ -320,7 +321,12 @@ class LayerRuleEditDialog(SingletonDialogMixin, Adw.Dialog):
 
     def _refresh(self) -> None:
         rule = self._build_rule()
-        self._preview_label.set_text(rule.to_line() if rule is not None else "(rule incomplete)")
+        if rule is None:
+            self._preview_label.set_text("(rule incomplete)")
+        else:
+            self._preview_label.set_text(
+                format_config_preview(config.KEYWORD_LAYERRULE, rule.body())
+            )
         # Apply gates on a non-empty namespace AND a non-empty rule name.
         ok = rule is not None and bool(rule.rule_name) and bool(rule.namespace.strip())
         self._apply_btn.set_sensitive(ok)
