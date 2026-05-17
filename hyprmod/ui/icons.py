@@ -13,6 +13,7 @@ every list that mirrors the sidebar.
 # (notably the pending-changes rows).
 BINDS_ICON = "keyboard-shortcuts-symbolic"
 MONITORS_ICON = "display-symbolic"
+WORKSPACES_ICON = "view-paged-symbolic"
 AUTOSTART_ICON = "media-playback-start-symbolic"
 ENV_VARS_ICON = "utilities-terminal-symbolic"
 WINDOW_RULES_ICON = "window-rules-symbolic"

@@ -42,17 +42,30 @@ def load_external_keyword_entries(
     if migrate_doc:
         hyprland_config.migrate(doc)
 
-    managed_str = str(managed_path)
+    # ``doc.find_all`` reports source paths in their resolved form
+    # (symlinks followed) but ``managed_path`` may carry a user-style
+    # path through ``~/.config`` that resolves to a dotfiles checkout.
+    # Compare resolved forms so the managed file isn't accidentally
+    # surfaced as "external".
+    try:
+        managed_resolved = managed_path.resolve()
+    except OSError:
+        managed_resolved = managed_path
     external: list[ExternalKeywordEntry] = []
     for keyword in keywords:
         for entry in doc.find_all(keyword):
-            if entry.source_name == managed_str:
+            entry_path = Path(entry.source_name)
+            try:
+                entry_resolved = entry_path.resolve()
+            except OSError:
+                entry_resolved = entry_path
+            if entry_resolved == managed_resolved:
                 continue
             external.append(
                 ExternalKeywordEntry(
                     key=entry.key,
                     value=entry.value,
-                    source_path=Path(entry.source_name),
+                    source_path=entry_path,
                     lineno=entry.lineno,
                 )
             )

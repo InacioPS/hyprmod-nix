@@ -14,6 +14,7 @@ from hyprmod.ui.icons import (
     PROFILES_ICON,
     SETTINGS_ICON,
     WINDOW_RULES_ICON,
+    WORKSPACES_ICON,
 )
 
 
@@ -202,6 +203,7 @@ class Sidebar:
 
         display = new_category("Display")
         add_row(display, "monitors", "Monitors", MONITORS_ICON)
+        add_row(display, "workspaces", "Workspaces", WORKSPACES_ICON)
 
         windowing = new_category("Window Management")
         # Dwindle/Master/Scrolling are merged into a single Layouts page

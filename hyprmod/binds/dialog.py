@@ -502,11 +502,12 @@ class BindEditDialog(Adw.Dialog):
         self._capture_btn.add_css_class("destructive-action")
         self._capture_btn.remove_css_class("suggested-action")
 
-        self._register_capture_submap()
         try:
+            self._register_capture_submap()
             self._window.hypr.dispatch("submap", "hyprmod_capture")
         except HyprlandError as e:
             log.warning("entering capture submap failed; aborting capture: %s", e)
+            self._window.show_toast(f"Couldn't start capture — {e}", timeout=5)
             self._capturing = False
             self._capture_btn.set_label("Record")
             self._capture_btn.remove_css_class("destructive-action")
@@ -571,9 +572,11 @@ class BindEditDialog(Adw.Dialog):
         # multimedia keysym that's absent from virtually every keyboard,
         # so it never matches and never fires.
         #
-        # ``noop`` (not ``pass``) is the dispatcher so the bind translates
-        # cleanly to Lua's ``hl.dsp.no_op()`` — functionally identical for
-        # a sentinel that never fires.
+        # ``submap, reset`` is the dispatcher: it exists in both Hyprlang
+        # and Lua modes (``noop`` is rejected as "Invalid dispatcher" by
+        # older Hyprlang-mode Hyprland builds), is non-destructive if the
+        # sentinel ever fires (just exits the capture submap), and
+        # translates cleanly to Lua's ``hl.dsp.submap("reset")``.
         #
         # We deliberately don't use ``bind = , catchall, …``: that catches
         # modifier-only key events (e.g. ``Hyper_L`` from ``caps:hyper``)
@@ -581,13 +584,10 @@ class BindEditDialog(Adw.Dialog):
         # only the sentinel, unmatched keys — including modifier presses —
         # pass through to the focused client by default, which is exactly
         # what the keysym tracker needs.
-        try:
-            self._window.hypr.define_submap(
-                "hyprmod_capture",
-                binds=[("bind", ", XF86LaunchA, noop,")],
-            )
-        except HyprlandError as e:
-            self._window.show_toast(f"Capture setup failed — {e}", timeout=5)
+        self._window.hypr.define_submap(
+            "hyprmod_capture",
+            binds=[("bind", ", XF86LaunchA, submap, reset")],
+        )
 
     def _on_dialog_closed(self, _dialog):
         if self._capturing:

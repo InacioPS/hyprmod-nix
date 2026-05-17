@@ -48,6 +48,7 @@ class ConfigSections:
 
     binds: list[str] | None = None
     monitors: list[str] | None = None
+    workspaces: list[str] | None = None
     animations: list[str] | None = None
     beziers: list[str] | None = None
     env: list[str] | None = None
@@ -255,6 +256,7 @@ def ensure_managed_path_matches_mode(stored: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 KEYWORD_MONITOR = "monitor"
+KEYWORD_WORKSPACE = "workspace"
 KEYWORD_ANIMATION = "animation"
 KEYWORD_BEZIER = "bezier"
 KEYWORD_UNBIND = "unbind"
@@ -277,6 +279,7 @@ KEYWORD_LAYERRULE = "layerrule"
 _MANAGED_NON_BIND_KEYWORDS = frozenset(
     (
         KEYWORD_MONITOR,
+        KEYWORD_WORKSPACE,
         KEYWORD_ANIMATION,
         KEYWORD_BEZIER,
         KEYWORD_UNBIND,
@@ -314,6 +317,9 @@ def read_all_sections(
     if not path.exists():
         return {}, {}
     doc = load_any(path, follow_sources=False, lenient=True)
+    # In-memory only — keeps the UI consistent when the on-disk file still
+    # uses legacy syntax. Persisting the migration requires user consent
+    # via the deprecation dialog (:mod:`hyprmod.core.deprecations`).
     migrate(doc)
     options: dict[str, str] = {}
     sections: dict[str, list[str]] = {}
@@ -455,6 +461,8 @@ def _build_document(values: dict[str, str], sections: ConfigSections) -> Documen
         _add_section(doc, "Animations", sections.animations)
     if sections.monitors:
         _add_section(doc, "Monitors", sections.monitors)
+    if sections.workspaces:
+        _add_section(doc, "Workspaces", sections.workspaces)
     if sections.binds:
         _add_section(doc, "Keybinds", sections.binds)
     # Window rules sit before autostart so any rule overrides are in effect
@@ -472,34 +480,24 @@ def _build_document(values: dict[str, str], sections: ConfigSections) -> Documen
     return doc
 
 
-def _apply_migrations(doc: Document) -> None:
-    """Run deprecation checks and migrations on *doc* in place.
+def _log_deprecations(doc: Document) -> None:
+    """Log any deprecated syntax in *doc* without mutating it.
 
-    Both ``check_deprecated`` and ``migrate`` already take a Document, so
-    no re-parsing is needed. Exceptions are swallowed — migration must
-    never block a save; the un-migrated document is what we'll serialize.
+    Save-side rewriting is intentionally not performed here — the schema
+    version guard at :func:`hyprmod.core.schema._drop_unavailable` already
+    constrains the keys we emit to ones supported by the running Hyprland,
+    and a buggy rename rule in hyprland-config (see GitHub issue #34) can
+    otherwise corrupt valid output. Persistent migrations are routed
+    through the user-confirmed flow in :mod:`hyprmod.core.deprecations`.
     """
     for d in check_deprecated(doc):
         log.info("deprecated syntax in outgoing config: %s", d)
-
-    try:
-        result = migrate(doc)
-    except Exception:  # noqa: BLE001 — migration must never block a save
-        log.exception("migration raised; writing un-migrated content")
-        return
-
-    if result.applied:
-        log.info(
-            "auto-migrated %d rule(s) on save: %s",
-            len(result.applied),
-            "; ".join(result.applied),
-        )
 
 
 def build_content(values: dict[str, str], sections: ConfigSections) -> str:
     """Build the Hyprlang-format text for the next save."""
     doc = _build_document(values, sections)
-    _apply_migrations(doc)
+    _log_deprecations(doc)
     return serialize_hyprlang(doc)
 
 
@@ -516,7 +514,7 @@ def to_managed_text(values: dict[str, str], sections: ConfigSections) -> str:
     just be noise on every save.
     """
     doc = _build_document(values, sections)
-    _apply_migrations(doc)
+    _log_deprecations(doc)
     return serialize_any(doc, managed_path(), emit_migration_markers=False)
 
 

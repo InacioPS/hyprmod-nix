@@ -13,16 +13,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - "Migrate to Lua…" wizard and main-window banner (Hyprland 0.55+) — converts your active `hyprland.conf` to `hyprland.lua`, rewrites the entrypoint include, and is dismissible
 - Per-monitor "Identify by description" toggle — emits `monitor=desc:…` instead of `monitor=DP-1, …` so the saved configuration follows the physical monitor across port changes (#26)
 - Per-monitor HDR controls — expanded Color Management presets (Auto/sRGB/Adobe/Wide/EDID/HDR/HDR EDID) and new SDR Brightness / SDR Saturation options that appear only when an HDR preset is active (#29)
+- Workspaces page — manage `workspace` rules with live preview and live IPC apply (#31)
+- Deprecation assistant — detect and migrate deprecated Hyprland syntax with explicit user confirmation and timestamped backups
 
 ### Changed
 
 - Bind dialog's Manual Edit modifier picker is a compact two-row chip strip instead of stacked switch rows
 - Options unavailable on the running Hyprland version are hidden instead of greyed-out; group headers collapse when every row in the group is unavailable
 - Profiles transcode on activation — saving in Hyprlang then activating in Lua (or vice-versa) just works
+- HyprMod no longer auto-migrates deprecated syntax silently on save; migrations are surfaced via the new deprecation assistant and require explicit user confirmation
 
 ### Fixed
 
 - Keybinds using the Hyper modifier (and `CAPS`/`MOD2`/`MOD3`/`MOD5`) are now displayed and recorded correctly — previously `Caps Lock + G` under `caps:hyper` rendered as `+ G` and Record captured only `G` (#27)
+- Toggling "Numlock by default" wrote an invalid `input:kb_numlock` option that Hyprland rejected on reload; the option is now written as `input:numlock_by_default` per the schema (#34)
+- Rules from your managed config no longer leak into the read-only "external rules" list when `hyprland-gui.conf` is reached through a symlinked path (typical dotfiles setup)
 
 ## [0.2.0] - 2026-05-07
 

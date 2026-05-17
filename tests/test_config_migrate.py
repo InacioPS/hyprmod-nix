@@ -1,9 +1,13 @@
-"""Tests for auto-migration of deprecated Hyprland syntax on save.
+"""Tests for the save-side behavior of ``hyprmod.core.config``.
 
-``write_all()`` owns ``hyprland-gui.conf``, so deprecated keys it wrote in
-past versions should be silently rewritten to current syntax on the next
-save.  These tests exercise the migration path without touching the user's
-own ``hyprland.conf``.
+After GitHub issue #34, hyprmod no longer auto-migrates deprecated syntax
+on save — a buggy rename rule in hyprland-config could silently corrupt
+otherwise-valid output. Migrations now route through the user-confirmed
+flow in :mod:`hyprmod.core.deprecations`. These tests pin that contract:
+
+- Deprecated keys pass through untouched on save.
+- Deprecations are *logged* (no UI side effects) so debug output still
+  surfaces what would have been rewritten.
 """
 
 import logging
@@ -11,28 +15,30 @@ import logging
 from hyprmod.core import config
 
 
-class TestAutoMigrateOnWrite:
-    def test_renames_deprecated_blur_keys(self, gui_conf_tmp):
-        """decoration:blur_size → decoration:blur:size on save."""
+class TestWriteAllDoesNotMigrate:
+    def test_passes_deprecated_blur_keys_through_untouched(self, gui_conf_tmp):
+        """decoration:blur_size used to be rewritten to decoration:blur:size on save.
+
+        That behavior is gone — the schema guard guarantees the UI only
+        emits supported keys, and silent rewriting could mask schema bugs
+        (see #34). If a deprecated key reaches write_all, it's the schema's
+        problem to surface, not write_all's to silently fix.
+        """
         config.write_all(
-            {"decoration:blur_size": "8", "decoration:blur_passes": "2"},
+            {"decoration:blur_size": "8"},
             config.ConfigSections(),
         )
         content = gui_conf_tmp.read_text()
-        assert "decoration:blur:size = 8" in content
-        assert "decoration:blur:passes = 2" in content
-        assert "decoration:blur_size" not in content
-        assert "decoration:blur_passes" not in content
+        assert "decoration:blur_size = 8" in content
+        assert "decoration:blur:size" not in content
 
-    def test_renames_no_cursor_warps(self, gui_conf_tmp):
-        """cursor:no_cursor_warps → cursor:no_warps on save."""
+    def test_passes_no_cursor_warps_through_untouched(self, gui_conf_tmp):
         config.write_all({"cursor:no_cursor_warps": "true"}, config.ConfigSections())
         content = gui_conf_tmp.read_text()
-        assert "cursor:no_warps = true" in content
-        assert "no_cursor_warps" not in content
+        assert "cursor:no_cursor_warps = true" in content
+        assert "no_warps" not in content
 
     def test_leaves_current_keys_untouched(self, gui_conf_tmp):
-        """Current-syntax keys pass through byte-for-byte."""
         config.write_all(
             {"general:gaps_in": "5", "decoration:blur:size": "8"},
             config.ConfigSections(),
@@ -41,48 +47,30 @@ class TestAutoMigrateOnWrite:
         assert "general:gaps_in = 5" in content
         assert "decoration:blur:size = 8" in content
 
-    def test_migrates_exec_once_in_bind_section(self, gui_conf_tmp):
-        """exec_once keyword gets renamed to exec-once when written as a raw line.
-
-        This matters because bind/env/monitor lines are passed as raw strings,
-        not through the ``values`` dict — the migration must still reach them.
-        """
+    def test_passes_exec_once_in_bind_section_untouched(self, gui_conf_tmp):
         config.write_all({}, config.ConfigSections(env=["exec_once = kitty"]))
         content = gui_conf_tmp.read_text()
-        assert "exec-once = kitty" in content
-        assert "exec_once" not in content
+        assert "exec_once = kitty" in content
+        assert "exec-once" not in content
 
-    def test_logs_applied_migration(self, gui_conf_tmp, caplog):
-        """Applied migrations are logged for debuggability."""
-        with caplog.at_level(logging.INFO, logger="hyprmod.core.config"):
-            config.write_all({"decoration:blur_size": "8"}, config.ConfigSections())
-        assert any("auto-migrated" in rec.message for rec in caplog.records)
-
-    def test_logs_deprecation_without_auto_migration(self, gui_conf_tmp, caplog):
-        """Deprecated keys that have no automatic migration are logged but kept.
-
-        ``general:max_fps`` is flagged as deprecated but has no migration — the
-        user/caller has to remove it manually. We still log it so it shows up in
-        debug output.
-        """
+    def test_logs_deprecated_syntax(self, gui_conf_tmp, caplog):
+        """Deprecations still surface in logs for debuggability."""
         with caplog.at_level(logging.INFO, logger="hyprmod.core.config"):
             config.write_all({"general:max_fps": "144"}, config.ConfigSections())
         assert any("deprecated syntax" in rec.message for rec in caplog.records)
-        content = gui_conf_tmp.read_text()
-        # No migration exists for this key, so it stays in the file.
-        assert "general:max_fps = 144" in content
+        # Key remains on disk — the user/dialog must fix it explicitly.
+        assert "general:max_fps = 144" in gui_conf_tmp.read_text()
 
-    def test_no_log_when_nothing_to_migrate(self, gui_conf_tmp, caplog):
-        """A clean config produces no migration log output."""
+    def test_no_auto_migrated_log_anymore(self, gui_conf_tmp, caplog):
+        """The old ``auto-migrated N rule(s)`` log line is gone."""
         with caplog.at_level(logging.INFO, logger="hyprmod.core.config"):
-            config.write_all({"general:gaps_in": "5"}, config.ConfigSections())
-        migration_logs = [r for r in caplog.records if "auto-migrated" in r.message]
-        assert migration_logs == []
+            config.write_all({"decoration:blur_size": "8"}, config.ConfigSections())
+        assert not any("auto-migrated" in rec.message for rec in caplog.records)
 
     def test_preserves_file_structure_headers(self, gui_conf_tmp):
-        """The ``# Generated by HyprMod`` header and section comments survive migration."""
+        """The ``# Generated by HyprMod`` header and section comments survive."""
         config.write_all(
-            {"decoration:blur_size": "8"},
+            {"general:gaps_in": "5"},
             config.ConfigSections(binds=["bind = SUPER, T, exec, kitty"]),
         )
         content = gui_conf_tmp.read_text()
@@ -91,37 +79,30 @@ class TestAutoMigrateOnWrite:
         assert "bind = SUPER, T, exec, kitty" in content
 
 
-class TestApplyMigrationsHelper:
-    """Direct tests for _apply_migrations — operates on a Document in place,
-    no string round trip."""
+class TestLogDeprecationsHelper:
+    """Direct tests for the (renamed, non-mutating) ``_log_deprecations`` helper."""
 
-    def test_no_op_when_no_migration_needed(self):
+    def test_no_op_when_no_deprecation(self, caplog):
         doc = config._build_document({"general:gaps_in": "5"}, config.ConfigSections())
         before = [line.raw for line in doc.lines]
-        config._apply_migrations(doc)
+        with caplog.at_level(logging.INFO, logger="hyprmod.core.config"):
+            config._log_deprecations(doc)
         after = [line.raw for line in doc.lines]
         assert before == after
+        assert not any("deprecated" in rec.message for rec in caplog.records)
 
-    def test_rewrites_deprecated_blur_key(self):
+    def test_does_not_mutate_deprecated_doc(self, caplog):
+        """A deprecated key stays in the document — _log_deprecations only logs."""
         doc = config._build_document({"decoration:blur_size": "8"}, config.ConfigSections())
-        config._apply_migrations(doc)
+        with caplog.at_level(logging.INFO, logger="hyprmod.core.config"):
+            config._log_deprecations(doc)
         text = config.serialize_hyprlang(doc)
-        assert "decoration:blur:size = 8" in text
-        assert "blur_size" not in text
-
-    def test_migration_exception_is_swallowed(self, caplog, monkeypatch):
-        """A migrate() crash must not block the save — the doc is left as-is."""
-        doc = config._build_document({"general:gaps_in": "5"}, config.ConfigSections())
-
-        def boom(_doc):
-            raise RuntimeError("boom")
-
-        monkeypatch.setattr(config, "migrate", boom)
-        config._apply_migrations(doc)  # must not raise
-        assert any("migration raised" in rec.message for rec in caplog.records)
+        assert "decoration:blur_size = 8" in text
+        assert "decoration:blur:size" not in text
+        assert any("deprecated syntax" in rec.message for rec in caplog.records)
 
 
-class TestWriteAllDoesNotRewriteWhenUnnecessary:
+class TestWriteAllIsStable:
     def test_content_is_stable_across_writes(self, gui_conf_tmp):
         """Writing the same clean values twice produces identical content."""
         config.write_all({"general:gaps_in": "5"}, config.ConfigSections())

@@ -28,9 +28,12 @@ from hyprmod.pages.profiles import ProfilesPage
 from hyprmod.pages.section import SectionPage
 from hyprmod.pages.settings import SettingsPage
 from hyprmod.pages.window_rules import WindowRulesPage
+from hyprmod.pages.workspaces import WorkspacesPage
 from hyprmod.ui import OptionRow, clear_children, confirm, create_option_row, make_page_layout
 from hyprmod.ui.about import build_about_dialog
 from hyprmod.ui.banner import DirtyBanner
+from hyprmod.ui.deprecation_controller import ACTION_NAME as DEPRECATIONS_ACTION
+from hyprmod.ui.deprecation_controller import DeprecationController
 from hyprmod.ui.lua_migration_controller import ACTION_NAME as LUA_MIGRATION_ACTION
 from hyprmod.ui.lua_migration_controller import LuaMigrationController
 from hyprmod.ui.options import digits_for_step
@@ -90,6 +93,7 @@ class HyprModWindow(Adw.ApplicationWindow):
         self._anim_details_box: Gtk.Box | None = None
         self._animations_page: AnimationsPage | None = None
         self._monitors_page: MonitorsPage | None = None
+        self._workspaces_page: WorkspacesPage | None = None
         self._binds_page: BindsPage | None = None
         self._cursor_page: CursorPage | None = None
         self._autostart_page: AutostartPage | None = None
@@ -256,6 +260,16 @@ class HyprModWindow(Adw.ApplicationWindow):
         )
         self._lua_migration.install_action(self)
 
+        # Deprecation assistant: scans the managed file + the user's main
+        # hyprland.conf for fixable deprecated syntax and offers a guided
+        # apply with backup.
+        self._deprecations = DeprecationController(
+            self,
+            self._settings,
+            show_toast=self.show_toast,
+        )
+        self._deprecations.install_action(self)
+
         # Hyprland status banner
         self._hyprland_banner = Adw.Banner(
             title="Hyprland not detected — changes will be saved to config files "
@@ -269,6 +283,8 @@ class HyprModWindow(Adw.ApplicationWindow):
         # rather than Adw.Banner because we need two actions (migrate +
         # don't-show-again), and Adw.Banner only allows one button.
         self._main_box.append(self._lua_migration.banner)
+        # Deprecation banner — visible when a scan finds fixable rules.
+        self._main_box.append(self._deprecations.banner)
 
         # Navigation split view
         self._split_view = Adw.NavigationSplitView()
@@ -302,6 +318,7 @@ class HyprModWindow(Adw.ApplicationWindow):
             for p in (
                 self._animations_page,
                 self._monitors_page,
+                self._workspaces_page,
                 self._binds_page,
                 self._cursor_page,
                 self._autostart_page,
@@ -370,6 +387,7 @@ class HyprModWindow(Adw.ApplicationWindow):
         section_page_specs: list[tuple[type, str, str, str]] = [
             (BindsPage, "_binds_page", "binds", "Keybinds"),
             (MonitorsPage, "_monitors_page", "monitors", "Monitors"),
+            (WorkspacesPage, "_workspaces_page", "workspaces", "Workspaces"),
             (AutostartPage, "_autostart_page", "autostart", "Autostart"),
             (EnvVarsPage, "_env_vars_page", "env_vars", "Env Variables"),
             (WindowRulesPage, "_window_rules_page", "window_rules", "Window Rules"),
@@ -447,6 +465,7 @@ class HyprModWindow(Adw.ApplicationWindow):
         migrate_item = Gio.MenuItem.new("Migrate to Lua…", f"win.{LUA_MIGRATION_ACTION}")
         migrate_item.set_attribute_value("hidden-when", GLib.Variant.new_string("action-disabled"))
         tools_section.append_item(migrate_item)
+        tools_section.append("Review deprecated syntax…", f"win.{DEPRECATIONS_ACTION}")
         menu.append_section(None, tools_section)
 
         help_section = Gio.Menu()
@@ -638,6 +657,8 @@ class HyprModWindow(Adw.ApplicationWindow):
             counts["binds"] += 1
         if self._monitors_page and self._monitors_page.is_dirty():
             counts["monitors"] += self._monitors_page.dirty_count()
+        if self._workspaces_page and self._workspaces_page.is_dirty():
+            counts["workspaces"] += self._workspaces_page.pending_change_count()
         if self._cursor_page and self._cursor_page.is_dirty():
             counts["cursor"] += 1
         if self._autostart_page and self._autostart_page.is_dirty():
@@ -1017,6 +1038,11 @@ class HyprModWindow(Adw.ApplicationWindow):
             lambda _p: bool(config.collect_section(saved_sections, config.KEYWORD_MONITOR)),
             lambda p: p.get_monitor_lines(),
         )
+        sections.workspaces = emit_if(
+            self._workspaces_page,
+            lambda _p: WorkspacesPage.has_managed_section(saved_sections),
+            lambda p: p.get_workspace_lines(),
+        )
 
         # Animations: bezier extraction is bespoke (curves used by emitted
         # animations need their definitions emitted alongside), so this one
@@ -1143,6 +1169,9 @@ class HyprModWindow(Adw.ApplicationWindow):
 
         if self._layer_rules_page is not None:
             self._layer_rules_page.reload_from_saved(sections)
+
+        if self._workspaces_page is not None:
+            self._workspaces_page.reload_from_saved(sections)
 
         self._undo.clear()
         self._banner.hide()
