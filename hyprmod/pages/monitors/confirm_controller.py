@@ -36,6 +36,13 @@ class ConfirmController:
         banner.set_button_label("Keep Changes")
         banner.connect("button-clicked", self._on_keep)
 
+    @property
+    def is_pending(self) -> bool:
+        # True from the moment a change debounces until the user confirms,
+        # the countdown expires, or cancel() runs. The window uses this to
+        # hold off auto-save while the safety window is open.
+        return self._showing or self._debounce.active
+
     def maybe_confirm(self):
         if self._is_dirty():
             self._schedule()
@@ -44,9 +51,16 @@ class ConfirmController:
 
     def confirm(self):
         """Accept the current monitor configuration (hides banner, stops countdown)."""
+        pending = self.is_pending
         self._debounce.cancel()
         if self._showing:
             self._on_keep()
+        elif pending:
+            # Debounce was active but banner hadn't shown yet — still
+            # treat as confirm so the snapshot stays current and the
+            # window's auto-save (deferred during the pending window via
+            # is_confirm_pending) gets a chance to reschedule.
+            self._on_confirmed()
 
     def cancel(self):
         self._debounce.cancel()

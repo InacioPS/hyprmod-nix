@@ -305,7 +305,7 @@ class HyprModWindow(Adw.ApplicationWindow):
         # Pending-changes chip lives in every page header (except the Pending
         # Changes page itself); the group keeps every chip's count in sync.
         self._pending_chips = PendingChipGroup(
-            on_click=lambda: self.show_page("pending"),
+            on_click=self._show_pending,
         )
 
         self._search_page_builder = SearchPage(self._schema)
@@ -644,6 +644,14 @@ class HyprModWindow(Adw.ApplicationWindow):
 
     def _update_sidebar_badges(self):
         """Update pending-change count badges on sidebar rows."""
+        if self.auto_save:
+            # Dirty state is just the 800ms debounce window with auto-save
+            # on; surfacing it would flicker the chip and badges on every
+            # change. Mirrors the dirty banner's gate in _update_banner.
+            self._sidebar.update_badges({})
+            self._pending_chips.set_count(0)
+            return
+
         # Count dirty options per schema group
         counts: Counter[str] = Counter()
         for key, state in self.app_state.options.items():
@@ -857,6 +865,14 @@ class HyprModWindow(Adw.ApplicationWindow):
                 self._pending_page.refresh()
             self._page_stack.set_visible_child_name(gid)
             self._content_nav.set_title(self._page_titles[gid])
+
+    def _show_pending(self):
+        # Pending Changes is a non-sidebar page; clearing the sidebar
+        # selection avoids the previous category's row staying highlighted
+        # while the content pane shows a different page. Mirrors how the
+        # search flow deselects on entry (see _on_search_changed).
+        self.show_page("pending")
+        self._sidebar.deselect_all()
 
     def navigate(self, group_id: str, *, option_key: str | None = None) -> None:
         """Switch to *group_id* and reflect it in the sidebar selection.
@@ -1277,12 +1293,27 @@ class HyprModWindow(Adw.ApplicationWindow):
         # If just enabled and there are unsaved changes, save immediately.
         if value and self.has_dirty():
             self.save()
+        # Reflect the toggle in the chip/badges/banner. Enabling clears them
+        # (gated on self.auto_save in the update helpers); disabling reveals
+        # any in-flight dirty state — e.g. changes from a pending debounce.
+        self._notify_ui_change()
 
     def _on_toggle_auto_save(self, action, _param):
         self.set_auto_save(not action.get_state().get_boolean())
 
     def _schedule_auto_save(self):
         """Debounced auto-save: wait 800ms after last change before writing."""
+        if self._monitors_page is not None and self._monitors_page.is_confirm_pending():
+            # The monitors confirm/revert banner is the safety net for
+            # potentially-unviewable monitor configs. Writing now would
+            # persist an unconfirmed config and mark_saved would cancel
+            # the auto-revert. Cancel (not just skip) so a timer scheduled
+            # by an earlier non-monitor change can't fire mid-confirm.
+            # When the user keeps the change, _on_confirmed → _notify_dirty
+            # → _on_section_dirty re-enters this method; a revert clears
+            # dirty state, so there's nothing to save.
+            self._auto_save_timer.cancel()
+            return
         self._auto_save_timer.schedule(800, self._auto_save_fire)
 
     def _auto_save_fire(self):

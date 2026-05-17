@@ -318,9 +318,12 @@ class MonitorsPage(SectionPage):
     def _on_monitors_changed(self):
         """Single hook called after any monitor state change."""
         self._update_card_states()
-        self._notify_dirty()
+        # Arm the confirm controller before notifying the window so the
+        # auto-save gate (window._schedule_auto_save) sees is_confirm_pending
+        # as True and defers the write until the user keeps or reverts.
         if self._confirm:
             self._confirm.maybe_confirm()
+        self._notify_dirty()
         self._update_gap_warning()
         self._update_preview_draggable()
 
@@ -596,6 +599,14 @@ class MonitorsPage(SectionPage):
         """Accept the current monitor configuration (e.g. when navigating away)."""
         if self._confirm:
             self._confirm.confirm()
+
+    def is_confirm_pending(self) -> bool:
+        # True while a monitor change is mid-confirm (debounce or 15s
+        # countdown). Auto-save defers writes during this window —
+        # otherwise a broken config would land on disk before the user
+        # has a chance to keep or revert, and mark_saved() would cancel
+        # the auto-revert.
+        return self._confirm is not None and self._confirm.is_pending
 
     def _save_snapshot(self):
         self._saved_monitors = copy.deepcopy(self._monitors)
