@@ -6,7 +6,6 @@ of what would change, and on Apply calls ``apply_to_file`` per selected
 plan, writing a timestamped backup beside each original.
 """
 
-import difflib
 from collections.abc import Callable
 from pathlib import Path
 
@@ -14,6 +13,7 @@ from gi.repository import Adw, Gtk
 
 from hyprmod.core import deprecations
 from hyprmod.ui.dialog import SingletonDialogMixin
+from hyprmod.ui.diff import ConfigDiffWidget
 
 
 class DeprecationDialog(SingletonDialogMixin, Adw.Dialog):
@@ -142,19 +142,19 @@ class DeprecationDialog(SingletonDialogMixin, Adw.Dialog):
         return row
 
     def _build_diff_view(self, plan: deprecations.FilePlan) -> Gtk.Widget:
-        diff_text = _unified_diff(plan.original, plan.migrated, plan.path.name)
-        buf = Gtk.TextBuffer()
-        buf.set_text(diff_text or "(no textual diff)")
-        view = Gtk.TextView(buffer=buf)
-        view.set_editable(False)
-        view.set_monospace(True)
-        view.set_cursor_visible(False)
-        view.set_top_margin(6)
-        view.set_bottom_margin(6)
-        view.set_left_margin(12)
-        view.set_right_margin(12)
-        view.add_css_class("card")
-        return view
+        frame = Gtk.Frame()
+        frame.add_css_class("config-diff-frame")
+        diff = ConfigDiffWidget()
+        diff.set_size_request(-1, 220)
+        diff.set_texts(
+            plan.original,
+            plan.migrated,
+            old_label="current",
+            new_label="after migration",
+            title=plan.path.name,
+        )
+        frame.set_child(diff)
+        return frame
 
     def _build_unfixable_group(self, scan: deprecations.ScanResult) -> None:
         group = Adw.PreferencesGroup(title="Detected but not auto-fixable")
@@ -207,25 +207,6 @@ class DeprecationDialog(SingletonDialogMixin, Adw.Dialog):
         if self._on_done is not None:
             self._on_done(results)
         self.close()
-
-
-def _unified_diff(original: str, migrated: str, name: str) -> str:
-    """Return a compact unified diff between *original* and *migrated*.
-
-    Empty trailing newlines are normalized so the diff doesn't end with a
-    spurious "\\ No newline at end of file" marker on inputs that already
-    end in a newline.
-    """
-    original_lines = original.splitlines(keepends=True)
-    migrated_lines = migrated.splitlines(keepends=True)
-    diff_iter = difflib.unified_diff(
-        original_lines,
-        migrated_lines,
-        fromfile=f"{name} (current)",
-        tofile=f"{name} (after migration)",
-        n=2,
-    )
-    return "".join(diff_iter)
 
 
 def _pill(text: str, css_class: str = "dim-label") -> Gtk.Label:
