@@ -140,11 +140,11 @@ row.spin spinbutton > text {
 
 /* Confirm banner urgency */
 banner.confirm-warning > revealer > widget {
-    background-color: alpha(@warning_bg_color, 0.3);
+    background-color: mix(@window_bg_color, @warning_bg_color, 0.3);
 }
 
 banner.confirm-urgent > revealer > widget {
-    background-color: alpha(@error_bg_color, 0.3);
+    background-color: mix(@window_bg_color, @error_bg_color, 0.3);
 }
 
 /* Monitor header badges: capabilities (HDR, 10-bit, VRR) and "Managed" */
