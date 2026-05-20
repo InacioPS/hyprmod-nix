@@ -6,7 +6,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
-from hyprland_config import coerce_config_value
+from hyprland_config import Rule, coerce_config_value
 from hyprland_socket import HyprlandError
 from hyprland_state import ANIM_LOOKUP, HyprlandState
 
@@ -187,6 +187,11 @@ class HyprModWindow(Adw.ApplicationWindow):
     def saved_values(self) -> dict[str, str]:
         """The option ``key = value`` assignments parsed from the managed config."""
         return config.read_cached()[0]
+
+    @property
+    def saved_rules(self) -> list[Rule]:
+        """Structured window/layer rules parsed from the managed config."""
+        return config.read_cached()[2]
 
     @property
     def option_rows(self) -> dict[str, OptionRow]:
@@ -1136,14 +1141,25 @@ class HyprModWindow(Adw.ApplicationWindow):
             lambda _p: AutostartPage.has_managed_section(saved_sections),
             lambda p: p.get_exec_lines(),
         )
+        # Rule pages live in the structured ``saved_rules`` list, not
+        # ``saved_sections``, so check there for ownership. Legacy v1
+        # layer rules that didn't normalise into Rule nodes still appear
+        # in ``saved_sections`` so the fallback covers them.
+        saved_rules = self.saved_rules
+        has_owned_window_rules = any(r.kind == "windowrule" for r in saved_rules) or bool(
+            saved_sections.get(config.KEYWORD_WINDOWRULE)
+        )
+        has_owned_layer_rules = any(r.kind == "layerrule" for r in saved_rules) or bool(
+            saved_sections.get(config.KEYWORD_LAYERRULE)
+        )
         sections.window_rules = emit_if(
             self._window_rules_page,
-            lambda _p: WindowRulesPage.has_managed_section(saved_sections),
+            lambda _p: has_owned_window_rules,
             lambda p: p.get_window_rule_lines(),
         )
         sections.layer_rules = emit_if(
             self._layer_rules_page,
-            lambda _p: LayerRulesPage.has_managed_section(saved_sections),
+            lambda _p: has_owned_layer_rules,
             lambda p: p.get_layer_rule_lines(),
         )
 

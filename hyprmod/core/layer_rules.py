@@ -57,10 +57,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from hyprland_config import LAYER_BOOL_EFFECTS, split_top_level
+from hyprland_config import LAYER_BOOL_EFFECTS, Rule, split_top_level
 
 from hyprmod.core import config
-from hyprmod.core.external import load_external_keyword_entries
+from hyprmod.core.external import load_external_rule_entries
 
 # Sequence of accepted keywords on read. Single-element tuple kept as a
 # tuple (not a bare string) so the external loader and any hypothetical
@@ -94,53 +94,133 @@ _DROPPED_LEGACY_EFFECTS: frozenset[str] = frozenset({"unset", "noshadow"})
 
 
 @dataclass(slots=True)
+class LayerEffect:
+    """A single ``EFFECT [ARGS]`` clause inside a layerrule.
+
+    Block-form rules (``layerrule { match:namespace waybar; blur =
+    on; ignore_alpha = 0.5 }``) become one :class:`LayerRule` with
+    several :class:`LayerEffect` entries; single-line rules collapse
+    to a one-element list.
+    """
+
+    name: str
+    args: str = ""
+
+    @property
+    def full(self) -> str:
+        """Serialize as ``name [args]`` with auto-``on`` for bool effects.
+
+        Hyprland 0.54.3 rejects bare bool effects with "invalid field
+        X: missing a value", so we always emit a value.
+        """
+        args = self.args.strip()
+        if not args and self.name in LAYER_BOOL_EFFECTS:
+            args = "on"
+        return f"{self.name} {args}" if args else self.name
+
+
+@dataclass(slots=True)
 class LayerRule:
-    """A single ``layerrule = match:namespace REGEX, EFFECT [VALUE]`` entry.
+    """A v2 layer rule: namespace match plus one or more effects.
 
     *namespace* is the regex matched against the layer surface's
     namespace (``waybar``, ``^(rofi|wofi)$``, ``notifications``).
     Stored verbatim so byte-for-byte round-trips survive even unusual
     escape sequences.
 
-    *rule_name* is the v3 effect name (``blur``, ``ignore_alpha``,
-    ``order``, …); *rule_args* is the space-joined argument string
-    (``""`` for bool effects when constructed from scratch — the
-    serializer auto-fills ``on``).
+    Hyprland's special-category form (``layerrule { name = X;
+    match:namespace = N; e1 = a; e2 = b }``) bundles multiple effects
+    under a single name; single-line rules carry exactly one effect
+    and no name. The serializer picks block vs. single-line at
+    :meth:`to_line` time based on whether *name*, *enabled*, or a
+    multi-effect list demand the block form.
     """
 
     namespace: str
-    rule_name: str
-    rule_args: str = ""
+    effects: list["LayerEffect"]
+    # Empty when the rule is anonymous. Naming enables hyprctl/Lua
+    # dynamic enable/disable.
+    name: str = ""
+    # False when the rule is defined-but-inactive (``enable = 0``).
+    enabled: bool = True
+
+    # -- Single-effect compatibility shims ---------------------------------
+    # Predates the multi-effect refactor; reads the first effect so
+    # legacy single-effect call sites keep working unchanged.
+
+    @property
+    def rule_name(self) -> str:
+        return self.effects[0].name if self.effects else ""
+
+    @property
+    def rule_args(self) -> str:
+        return self.effects[0].args if self.effects else ""
 
     @property
     def effect_full(self) -> str:
-        """Return ``rule_name`` plus args, with auto-``on`` for bool effects.
-
-        Hyprland 0.54.3 rejects bare bool effects with "invalid field
-        X: missing a value", so we always emit a value. Mirrors
-        ``WindowRule.effect_full`` for v3 windowrule bool effects.
-        """
-        args = self.rule_args.strip()
-        if not args and self.rule_name in LAYER_BOOL_EFFECTS:
-            args = "on"
-        if args:
-            return f"{self.rule_name} {args}"
-        return self.rule_name
+        return self.effects[0].full if self.effects else ""
 
     def body(self) -> str:
-        """Serialize as ``match:namespace REGEX, EFFECT [VALUE]``.
+        """Serialize as the v2 single-line value half of the rule.
 
-        Match clause first by convention — reads as "for this surface,
-        do this." Hyprland accepts either order, but match-first
-        mirrors the windowrule serialization for consistency. Returned
-        as the value half of the keyword; live-apply via
-        ``hypr.keyword("layerrule", body)`` wants exactly this string.
+        Returns ``match:namespace REGEX, EFFECT [VALUE], …`` — the
+        match clause first by convention. Live-apply via
+        ``hypr.keyword("layerrule", body)`` wants exactly this; the
+        keyword prefix is supplied separately. :attr:`name` and the
+        disabled flag are intentionally omitted because Hyprland's
+        single-line handler rejects them. Use :meth:`to_line` for the
+        on-disk form that switches to block when those fields demand it.
         """
-        return f"match:namespace {self.namespace}, {self.effect_full}"
+        parts = [f"match:namespace {self.namespace}"]
+        parts.extend(e.full for e in self.effects)
+        return ", ".join(parts)
+
+    def to_rule_node(self) -> Rule:
+        """Build the equivalent library :class:`hyprland_config.Rule` node.
+
+        Mirrors :meth:`hyprmod.core.window_rules.WindowRule.to_rule_node`:
+        feeds the language-specific serializers
+        (:func:`hyprland_config.render_rule_hyprlang`,
+        :func:`hyprland_config.render_rule_lua`) without going through a
+        stringly-typed intermediate.
+        """
+        return Rule(
+            raw="",
+            kind=config.KEYWORD_LAYERRULE,
+            name=self.name,
+            enabled=self.enabled,
+            matchers=[("namespace", self.namespace)],
+            effects=[(e.name, e.args) for e in self.effects],
+        )
 
     def to_line(self) -> str:
-        """Serialize as the full ``layerrule = …`` config line."""
+        """Serialize as on-disk form: single-line keyword OR block.
+
+        Block form is used when the rule carries a :attr:`name` or is
+        disabled — those fields only exist in block syntax. Anonymous
+        enabled rules, including multi-effect ones, emit as compact
+        single-line.
+        """
+        needs_block = bool(self.name) or not self.enabled
+        if needs_block:
+            return self._to_block()
         return f"{config.KEYWORD_LAYERRULE} = {self.body()}"
+
+    def _to_block(self) -> str:
+        """Serialize as a multi-line ``layerrule { … }`` block."""
+        lines = [f"{config.KEYWORD_LAYERRULE} {{"]
+        if self.name:
+            lines.append(f"    name = {self.name}")
+        if not self.enabled:
+            lines.append("    enable = 0")
+        lines.append(f"    match:namespace = {self.namespace}")
+        for e in self.effects:
+            args = e.args.strip()
+            if not args and e.name in LAYER_BOOL_EFFECTS:
+                args = "on"
+            lines.append(f"    {e.name} = {args}" if args else f"    {e.name} =")
+        lines.append("}")
+        return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -417,13 +497,20 @@ def parse_layer_rule_line(line: str) -> LayerRule | None:
 
 
 def _parse_body_with_split(body: str) -> list[LayerRule]:
-    """Parse a layerrule body, returning N LayerRule entries — one per effect.
+    """Parse a layerrule body, returning LayerRule entries for the line.
 
-    Handles both v3 (``match:namespace …, effect …``) and legacy
-    (``effect, namespace``) shapes. Multi-effect v3 lines split into
-    N rules sharing the same namespace so a round-trip preserves all
-    effects without merging them into a single rule (which would lose
-    information when the user edits one).
+    Handles the two text shapes Hyprland's single-line handler accepts:
+
+    - **v2 single-line** (``match:namespace …, effect …``): split into
+      N single-effect rules so an anonymous multi-effect line preserves
+      its on-disk shape after a round-trip.
+    - **Legacy v1** (``effect, namespace``): single-effect rule with
+      effect names migrated to v2 form (``noanim`` → ``no_anim``, etc.).
+
+    Block-form / named layerrules are normalised upstream by
+    :func:`hyprland_config.migrate` into :class:`hyprland_config.Rule`
+    nodes and never reach this parser — :func:`from_rule_node` is the
+    structured-input entry point for those.
     """
     tokens = split_top_level(body)
     if not tokens:
@@ -434,22 +521,23 @@ def _parse_body_with_split(body: str) -> list[LayerRule]:
     legacy_namespace_candidates: list[str] = []
 
     for tok in tokens:
-        match_pair = _parse_match_token(tok)
+        stripped = tok.strip()
+        match_pair = _parse_match_token(stripped)
         if match_pair is not None:
-            key, value = match_pair
+            mkey, mvalue = match_pair
             # Layer rules only honour ``match:namespace`` at runtime;
             # we still accept other prop keys to round-trip future
             # additions, but for our data model only the namespace
             # matters. First-wins on duplicate namespace tokens.
-            if key == "namespace" and namespace is None:
-                namespace = value
+            if mkey == "namespace" and namespace is None:
+                namespace = mvalue
             continue
 
         # Effect token: first space-separated word is the name, rest is args.
-        name, _, args = tok.partition(" ")
-        name = name.strip()
-        args = args.strip()
-        if not name:
+        ename, _, eargs = stripped.partition(" ")
+        ename = ename.strip()
+        eargs = eargs.strip()
+        if not ename:
             continue
 
         # Legacy form recognition: in pre-0.54 layerrule syntax, the
@@ -457,28 +545,22 @@ def _parse_body_with_split(body: str) -> list[LayerRule]:
         # and without a space-separated value (e.g. ``blur, waybar``
         # or ``blur, ^(waybar)$``). If a token has no space (no value),
         # it's a candidate legacy namespace.
-        if not args:
-            # Could be a nullary legacy effect like ``unset`` or a
-            # legacy namespace — disambiguate by checking the legacy
-            # rename table. Names found in :data:`_LEGACY_EFFECT_RENAMES`
-            # or in our v3 catalog stay as effects (the migration step
-            # below assigns ``on`` for bool effects). Anything else is
-            # treated as the legacy namespace.
+        if not eargs:
             looks_like_effect = (
-                name in _LEGACY_EFFECT_RENAMES
-                or name in LAYER_ACTION_PRESETS_BY_ID
-                or name in _DROPPED_LEGACY_EFFECTS
+                ename in _LEGACY_EFFECT_RENAMES
+                or ename in LAYER_ACTION_PRESETS_BY_ID
+                or ename in _DROPPED_LEGACY_EFFECTS
             )
             if not looks_like_effect:
-                legacy_namespace_candidates.append(name)
+                legacy_namespace_candidates.append(ename)
                 continue
 
-        migrated = _migrate_legacy_effect(name, args)
+        migrated = _migrate_legacy_effect(ename, eargs)
         if migrated is None:
             continue  # legacy effect with no v3 equivalent — drop
         effects.append(migrated)
 
-    # Legacy form fallback: if we didn't find a v3 ``match:namespace``
+    # Legacy form fallback: if we didn't find a v2 ``match:namespace``
     # token but did see a bare namespace candidate, use the *last*
     # such candidate (Hyprland's legacy parser took the rightmost
     # comma-separated token as the namespace).
@@ -488,7 +570,9 @@ def _parse_body_with_split(body: str) -> list[LayerRule]:
     if namespace is None or not effects:
         return []
 
-    return [LayerRule(namespace=namespace, rule_name=n, rule_args=a) for n, a in effects]
+    return [
+        LayerRule(namespace=namespace, effects=[LayerEffect(name=n, args=a)]) for n, a in effects
+    ]
 
 
 def parse_layer_rule_lines(lines: list[str]) -> list[LayerRule]:
@@ -515,24 +599,81 @@ def serialize(items: list[LayerRule]) -> list[str]:
     return [item.to_line() for item in items]
 
 
+def from_rule_node(node: "Rule") -> LayerRule | None:
+    """Build a :class:`LayerRule` from a library :class:`Rule`.
+
+    Returns ``None`` for non-layerrule nodes (lets callers iterate a
+    mixed Rule list with a one-liner filter-and-convert).
+    """
+    if node.kind != config.KEYWORD_LAYERRULE:
+        return None
+    namespace = ""
+    for k, v in node.matchers:
+        if k == "namespace":
+            namespace = v
+            break
+    if not namespace or not node.effects:
+        return None
+    return LayerRule(
+        namespace=namespace,
+        effects=[LayerEffect(name=n, args=a) for n, a in node.effects],
+        name=node.name,
+        enabled=node.enabled,
+    )
+
+
+def from_rule_nodes(nodes: list["Rule"]) -> list[LayerRule]:
+    """Convert a Document's :class:`Rule` list into UI :class:`LayerRule`s.
+
+    Mirrors :func:`hyprmod.core.window_rules.from_rule_nodes`: named
+    rules stay bundled, anonymous multi-effect rules split per effect
+    so the page UI's "one row per effect" model holds.
+    """
+    out: list[LayerRule] = []
+    for node in nodes:
+        lr = from_rule_node(node)
+        if lr is None:
+            continue
+        if lr.name or len(lr.effects) <= 1:
+            out.append(lr)
+            continue
+        for effect in lr.effects:
+            out.append(
+                LayerRule(
+                    namespace=lr.namespace,
+                    effects=[effect],
+                    enabled=lr.enabled,
+                )
+            )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Summaries (for row titles and pending-changes copy)
 # ---------------------------------------------------------------------------
 
 
-def summarize_action(rule: LayerRule) -> str:
-    """Friendly label for a rule's effect (e.g. ``Animation style: slide``)."""
-    preset = LAYER_ACTION_PRESETS_BY_ID.get(rule.rule_name)
+def _summarize_one_effect(effect: LayerEffect) -> str:
+    """Friendly label for one effect (e.g. ``Animation style: slide``)."""
+    preset = LAYER_ACTION_PRESETS_BY_ID.get(effect.name)
     if preset is None:
-        full = rule.effect_full
+        full = effect.full
         return full or "(no rule)"
-    args = rule.rule_args.strip()
+    args = effect.args.strip()
     # Bool effects auto-fill ``on`` on serialization but read cleaner
-    # in the title without the redundant value — "Blur background"
-    # beats "Blur background: on".
+    # in the title without the redundant value.
     if not args or args.lower() == "on":
         return preset.label
     return f"{preset.label}: {args}"
+
+
+def summarize_action(rule: LayerRule) -> str:
+    """Friendly label for a rule's effects, multi-effect joined with ``+``."""
+    if not rule.effects:
+        return "(no rule)"
+    if len(rule.effects) == 1:
+        return _summarize_one_effect(rule.effects[0])
+    return " + ".join(_summarize_one_effect(e) for e in rule.effects)
 
 
 def summarize_namespace(rule: LayerRule) -> str:
@@ -542,7 +683,12 @@ def summarize_namespace(rule: LayerRule) -> str:
 
 def summarize_rule(rule: LayerRule) -> tuple[str, str]:
     """Two-line ``(title, subtitle)`` summary for an ``Adw.ActionRow``."""
-    return summarize_action(rule), summarize_namespace(rule)
+    subtitle = summarize_namespace(rule)
+    if rule.name:
+        subtitle = f"{subtitle} · {rule.name}"
+    if not rule.enabled:
+        subtitle = f"{subtitle} (disabled)"
+    return summarize_action(rule), subtitle
 
 
 # ---------------------------------------------------------------------------
@@ -566,27 +712,35 @@ def load_external_layer_rules(
     """Walk *root_path* and its sourced files for layerrule entries
     that don't live in *managed_path*.
 
-    Mirrors :func:`hyprmod.core.window_rules.load_external_window_rules`.
-    Errors return an empty list (advisory display only; failing
-    silently is safer than blocking the page on a flaky config).
-
-    Both v3 and legacy lines surface as :class:`LayerRule` instances —
-    the parser auto-migrates legacy effect names so users see a
-    consistent view regardless of which syntax their config uses.
+    v2 layerrules (``layerrule = match:namespace …, effect …``) and
+    block-form rules surface as structured :class:`Rule` nodes from
+    ``hyprland_config.migrate()``. Legacy v1 rules
+    (``layerrule = effect, namespace`` — no ``match:`` prefix) fall
+    through the normaliser and stay as ``Keyword`` lines; we still
+    surface them by running them through hyprmod's lenient v1 parser
+    so users with hand-rolled old configs see their rules in the UI.
     """
-    # Layer-rule parsing handles legacy aliases itself, so unlike window rules
-    # this path does not require a document-wide migration pass.
-    entries = load_external_keyword_entries(
-        root_path,
-        managed_path,
-        LAYER_RULE_KEYWORDS,
-    )
+    from hyprmod.core.external import load_external_keyword_entries
+
     external: list[ExternalLayerRule] = []
-    for entry in entries:
+    for entry in load_external_rule_entries(root_path, managed_path, (config.KEYWORD_LAYERRULE,)):
+        lr = from_rule_node(entry.rule)
+        if lr is None:
+            continue
+        external.append(
+            ExternalLayerRule(
+                rule=lr,
+                source_path=entry.source_path,
+                lineno=entry.lineno,
+            )
+        )
+
+    # Legacy v1 lines stayed as Keyword nodes — parse them via hyprmod's
+    # lenient fallback so users with pre-0.54 configs still see them.
+    for entry in load_external_keyword_entries(
+        root_path, managed_path, LAYER_RULE_KEYWORDS, migrate_doc=True
+    ):
         line = f"{entry.key} = {entry.value}"
-        # Multi-effect lines split into multiple rules, each carried
-        # separately so the UI can show every effect with its source
-        # location.
         for rule in parse_layer_rule_lines([line]):
             external.append(
                 ExternalLayerRule(
@@ -606,7 +760,10 @@ __all__ = [
     "ExternalLayerRule",
     "LayerActionField",
     "LayerActionPreset",
+    "LayerEffect",
     "LayerRule",
+    "from_rule_node",
+    "from_rule_nodes",
     "load_external_layer_rules",
     "lookup_preset",
     "parse_layer_rule_line",

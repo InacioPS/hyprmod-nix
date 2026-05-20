@@ -50,11 +50,10 @@ from hyprland_socket import HyprlandError
 
 from hyprmod.core import config
 from hyprmod.core.layer_rules import (
-    LAYER_RULE_KEYWORDS,
     ExternalLayerRule,
     LayerRule,
+    from_rule_nodes,
     load_external_layer_rules,
-    parse_layer_rule_lines,
     serialize,
     summarize_rule,
 )
@@ -101,10 +100,11 @@ class LayerRulesPage(SavedListSectionPage[LayerRule]):
     # ── Loading ──
 
     def _load(self, saved_sections: dict[str, list[str]] | None) -> None:
-        if saved_sections is None:
-            saved_sections = self._window.saved_sections
-        raw_lines = config.collect_section(saved_sections, *LAYER_RULE_KEYWORDS)
-        items = parse_layer_rule_lines(raw_lines)
+        # Layer rules come through as structured :class:`Rule` nodes from
+        # ``hyprland_config.migrate()``; the adapter converts them to UI
+        # :class:`LayerRule` entries (same pattern as windowrule page).
+        del saved_sections
+        items = from_rule_nodes(self._window.saved_rules)
         self._owned = SavedList(items, key=lambda r: r.to_line())
         self._external = load_external_layer_rules(config.user_entry_path(), config.managed_path())
 
@@ -249,9 +249,13 @@ class LayerRulesPage(SavedListSectionPage[LayerRule]):
         window-rules page where existing windows need explicit
         ``setprop`` per-window dispatch.
 
-        Returns ``True`` if the keyword push succeeded (a toast has
-        already been shown on failure).
+        Disabled rules (``enabled=False``) skip the push entirely —
+        the user's intent is "defined but inactive", and the keyword
+        would activate the rule until the next reload. Returns
+        ``True`` when the rule was actually pushed.
         """
+        if not rule.enabled:
+            return False
         return try_with_toast(
             self._window.show_toast,
             "Layer rule failed",
@@ -318,11 +322,6 @@ class LayerRulesPage(SavedListSectionPage[LayerRule]):
         is exactly what's written.
         """
         return serialize(list(self._owned))
-
-    @staticmethod
-    def has_managed_section(sections: dict[str, list[str]]) -> bool:
-        """True if the saved config already contains any layer-rule lines."""
-        return any(sections.get(kw) for kw in LAYER_RULE_KEYWORDS)
 
 
 __all__ = ["LayerRulesPage"]

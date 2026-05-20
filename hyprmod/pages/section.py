@@ -451,9 +451,18 @@ class SavedListSectionPage[T: LineSerialisable](SectionPage):
     # ── Deleted-baseline detection ──
 
     def _deleted_baselines(self) -> list[T]:
-        """Return saved entries that are no longer in the owned list."""
-        current = {e.to_line() for e in self._owned}
-        return [b for b in self._owned.saved if b.to_line() not in current]
+        """Return saved entries that are no longer in the owned list.
+
+        Shares :func:`iter_item_changes`'s positional baseline tracking
+        so an edited item (where ``to_line()`` shifted but the row
+        position still carries the original baseline) is reported as a
+        modification, not as remove + add. Using set membership on
+        ``to_line()`` alone double-counts those edits as deletions —
+        the surviving baseline never lines up with the new ``to_line()``.
+        """
+        baselines = [self._owned.get_baseline(i) for i in range(len(self._owned))]
+        changes = iter_item_changes(self._owned.saved, list(self._owned), baselines)
+        return [item for kind, _, item, _ in changes if kind == "removed"]
 
     # ── Reorder / pending-change roll-ups ──
 

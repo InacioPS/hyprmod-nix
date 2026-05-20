@@ -62,6 +62,27 @@ class TestScan:
         assert result.has_fixable is False
         assert result.files == ()
 
+    def test_skips_pure_token_reorder_with_no_warnings(self, tmp_path):
+        """A v3 windowrule authored with effects before matchers serializes
+        back with matchers first under ``normalize_rules``. That text
+        difference is cosmetic — Hyprland accepts both orders — and
+        carries no ``check_deprecated`` warning, so the scan must not
+        surface it as a fixable file (would otherwise produce a false-
+        positive "Migrate deprecated syntax" banner).
+        """
+        managed = _write(tmp_path / "managed.conf", "")
+        user_root = _write(
+            tmp_path / "hyprland.conf",
+            "windowrule = stay_focused on, match:title ^Albert$\n"
+            "windowrule = float on, match:title ^Settings$\n",
+        )
+
+        result = deprecations.scan(managed_path=managed, user_root_path=user_root)
+
+        assert result.has_fixable is False
+        assert result.files == ()
+        assert result.unfixable == ()
+
     def test_skips_missing_files(self, tmp_path):
         """Non-existent entrypoints are silently ignored."""
         result = deprecations.scan(

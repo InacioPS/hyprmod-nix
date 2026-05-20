@@ -8,9 +8,12 @@ group cohesive concerns:
   v3 keyword/effect/matcher constants, the action and matcher catalogs
   the rule-edit dialog renders, and the ``summarize_*`` helpers used
   for row titles.
-- :mod:`._parse` — v3 ``windowrule = …`` parser plus ``serialize``.
-  Legacy ``windowrulev2`` lines are migrated to v3 upstream by
-  ``hyprland_config.migrate()``; the parser itself is v3-only.
+- :mod:`._parse` — adapters between the library's structured
+  :class:`hyprland_config.Rule` nodes and hyprmod's UI-facing
+  :class:`WindowRule`, plus the Hyprlang text :func:`serialize`.
+  ``hyprland_config.migrate()`` upstream normalises every authored
+  shape (single-line ``windowrule = …`` and block-form
+  ``windowrule { … }``) into Rule nodes before they reach here.
 - :mod:`._runtime` — matcher evaluation against HyprMod's own window
   (gates the self-target confirm) and live windows (drives the
   retroactive dispatch); apply / revert dispatcher mappings.
@@ -39,6 +42,7 @@ from hyprmod.core.window_rules._model import (
     WINDOW_RULE_KEYWORDS,
     ActionField,
     ActionPreset,
+    Effect,
     Matcher,
     MatcherKind,
     WindowRule,
@@ -49,6 +53,8 @@ from hyprmod.core.window_rules._model import (
     summarize_rule,
 )
 from hyprmod.core.window_rules._parse import (
+    from_rule_node,
+    from_rule_nodes,
     parse_window_rule_line,
     parse_window_rule_lines,
     serialize,
@@ -77,11 +83,14 @@ __all__ = [
     "WINDOW_RULE_KEYWORDS",
     "ActionField",
     "ActionPreset",
+    "Effect",
     "ExternalWindowRule",
     "Matcher",
     "MatcherKind",
     "WindowRule",
-    # Parse / serialize.
+    # Rule-node adapters & serialize.
+    "from_rule_node",
+    "from_rule_nodes",
     "parse_window_rule_line",
     "parse_window_rule_lines",
     "serialize",

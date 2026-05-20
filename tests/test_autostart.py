@@ -685,7 +685,7 @@ class TestWriteIntegration:
                 ],
             ),
         )
-        _, sections = config.read_all_sections()
+        _, sections, _rules = config.read_all_sections()
         assert sections.get(config.KEYWORD_EXEC_ONCE) == ["exec-once = waybar"]
         assert sections.get(config.KEYWORD_EXEC) == ["exec = something"]
 
@@ -700,7 +700,7 @@ class TestWriteIntegration:
                 ],
             ),
         )
-        _, sections = config.read_all_sections()
+        _, sections, _rules = config.read_all_sections()
         # Same call shape the AutostartPage uses on init.
         result = config.collect_section(sections, *EXEC_KEYWORDS)
         # The order between *EXEC_KEYWORDS groups follows the EXEC_KEYWORDS

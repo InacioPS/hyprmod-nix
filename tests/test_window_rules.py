@@ -35,6 +35,7 @@ from hyprmod.core.window_rules import (
     HYPRMOD_APP_ID,
     RAW_KEY,
     RETROACTIVE_EFFECTS,
+    Effect,
     ExternalWindowRule,
     Matcher,
     WindowRule,
@@ -131,9 +132,39 @@ class TestParseV3:
 # with the correct content.
 
 
+class TestReadPathMigratesBlockRules:
+    """End-to-end: block-form rules in the on-disk config make it into
+    hyprmod's data model via ``read_all_sections`` as structured Rule nodes."""
+
+    def test_named_block_round_trips_through_managed_config(self, tmp_path, monkeypatch):
+        from hyprmod.core import config as core_config
+        from hyprmod.core.window_rules import from_rule_nodes
+
+        conf = tmp_path / "hyprland-gui.conf"
+        conf.write_text(
+            "windowrule {\n"
+            "    name = apply-something\n"
+            "    match:class = my-window\n"
+            "    border_size = 10\n"
+            "}\n"
+        )
+        monkeypatch.setattr(core_config, "_DEFAULT_MANAGED_BASE", conf.with_suffix(""))
+        monkeypatch.setattr("hyprland_config.default_config_dir", lambda: tmp_path)
+
+        _, _, rule_nodes = core_config.read_all_sections()
+        rules = from_rule_nodes(rule_nodes)
+        assert len(rules) == 1
+        assert rules[0].name == "apply-something"
+        assert rules[0].effects[0].name == "border_size"
+        assert rules[0].effects[0].args == "10"
+        assert "name = apply-something" in rules[0].to_line()
+        assert "match:class = my-window" in rules[0].to_line()
+
+
 class TestReadPathMigratesV2:
     def test_read_all_sections_rewrites_v2_to_v3(self, tmp_path, monkeypatch):
         from hyprmod.core import config as core_config
+        from hyprmod.core.window_rules import from_rule_nodes
 
         conf = tmp_path / "hyprland-gui.conf"
         conf.write_text(
@@ -141,16 +172,23 @@ class TestReadPathMigratesV2:
             "windowrulev2 = noblur, initialClass:^(kitty)$\n"
         )
         monkeypatch.setattr(core_config, "_DEFAULT_MANAGED_BASE", conf.with_suffix(""))
-        # Force Hyprlang mode so managed_path() resolves to ``conf``.
         monkeypatch.setattr("hyprland_config.default_config_dir", lambda: tmp_path)
 
-        _, sections = core_config.read_all_sections()
-        # All entries land under the v3 keyword after migration; the
-        # v2 keyword should be empty (or absent) in the collected map.
+        _, sections, rule_nodes = core_config.read_all_sections()
+        # All entries get rewritten to v3 and normalised into Rule
+        # nodes; nothing should remain in the legacy keyword bucket.
         assert not sections.get("windowrulev2")
-        v3_lines = sections.get("windowrule", [])
-        assert any("match:class ^(firefox)$" in ln and "float on" in ln for ln in v3_lines)
-        assert any("match:initial_class ^(kitty)$" in ln and "no_blur on" in ln for ln in v3_lines)
+        rules = from_rule_nodes(rule_nodes)
+        assert any(
+            r.effects[0].name == "float"
+            and any(m.key == "class" and m.value == "^(firefox)$" for m in r.matchers)
+            for r in rules
+        )
+        assert any(
+            r.effects[0].name == "no_blur"
+            and any(m.key == "initial_class" and m.value == "^(kitty)$" for m in r.matchers)
+            for r in rules
+        )
 
     def test_read_all_sections_recovers_corrupted_v3_in_v2_packaging(self, tmp_path, monkeypatch):
         # The hyprland-config<0.4.4 corruption pattern: a v3 body
@@ -158,19 +196,19 @@ class TestReadPathMigratesV2:
         # with a stray ``title:`` glued onto the effect. Migration
         # detects the v3 marker and strips the bogus prefix.
         from hyprmod.core import config as core_config
+        from hyprmod.core.window_rules import from_rule_nodes
 
         conf = tmp_path / "hyprland-gui.conf"
         conf.write_text(r"windowrulev2 = match:class ^(foo)$, title:float on" + "\n")
         monkeypatch.setattr(core_config, "_DEFAULT_MANAGED_BASE", conf.with_suffix(""))
-        # Force Hyprlang mode so managed_path() resolves to ``conf``.
         monkeypatch.setattr("hyprland_config.default_config_dir", lambda: tmp_path)
 
-        _, sections = core_config.read_all_sections()
-        v3_lines = sections.get("windowrule", [])
-        assert v3_lines, "expected migrated v3 line"
-        assert "title:float" not in v3_lines[0]
-        assert "match:class ^(foo)$" in v3_lines[0]
-        assert "float on" in v3_lines[0]
+        _, _, rule_nodes = core_config.read_all_sections()
+        rules = from_rule_nodes(rule_nodes)
+        assert len(rules) == 1
+        assert rules[0].effects[0].name == "float"
+        assert rules[0].effects[0].args == "on"
+        assert rules[0].matchers == [Matcher(key="class", value="^(foo)$")]
 
     def test_load_external_window_rules_migrates_v2(self, tmp_path):
         # The external-rules loader runs migration too, so v2 lines
@@ -208,13 +246,11 @@ class TestRoundTrip:
         rules = [
             WindowRule(
                 matchers=[Matcher(key="class", value="^(firefox)$")],
-                effect_name="float",
-                effect_args="on",
+                effects=[Effect(name="float", args="on")],
             ),
             WindowRule(
                 matchers=[Matcher(key="class", value="^(pavucontrol)$")],
-                effect_name="pin",
-                effect_args="on",
+                effects=[Effect(name="pin", args="on")],
             ),
         ]
         assert serialize(rules) == [
@@ -228,8 +264,7 @@ class TestRoundTrip:
         # appends ``on`` so we never write a syntax error.
         rule = WindowRule(
             matchers=[Matcher(key="class", value="^(kitty)$")],
-            effect_name="float",
-            effect_args="",
+            effects=[Effect(name="float")],
         )
         assert rule.to_line().endswith(", float on")
 
@@ -238,8 +273,7 @@ class TestRoundTrip:
         # and don't gain a spurious ``on``.
         rule = WindowRule(
             matchers=[Matcher(key="class", value="^(kitty)$")],
-            effect_name="opacity",
-            effect_args="0.8 0.95",
+            effects=[Effect(name="opacity", args="0.8 0.95")],
         )
         assert rule.to_line().endswith(", opacity 0.8 0.95")
 
@@ -256,6 +290,126 @@ class TestRoundTrip:
         assert out[1].effect_name == "no_blur"
         # Same matchers on both.
         assert out[0].matchers == out[1].matchers
+
+
+class TestNamedBlockRules:
+    """Named / block-form rules (the user-authored shape that hyprmod
+    issue #37 reported). End-to-end via ``parse_window_rule_lines``,
+    which feeds the canonical ``parse_string`` + ``migrate`` pipeline.
+    """
+
+    def test_parse_named_single_effect(self):
+        # The exact authored shape from hyprmod issue #37.
+        rules = parse_window_rule_lines(
+            [
+                "windowrule {",
+                "    name = apply-something",
+                "    match:class = my-window",
+                "    border_size = 10",
+                "}",
+            ]
+        )
+        assert len(rules) == 1
+        assert rules[0].name == "apply-something"
+        assert rules[0].enabled is True
+        assert rules[0].matchers == [Matcher(key="class", value="my-window")]
+        assert rules[0].effects == [Effect(name="border_size", args="10")]
+
+    def test_parse_named_multi_effect_stays_bundled(self):
+        rules = parse_window_rule_lines(
+            [
+                "windowrule {",
+                "    name = bundle",
+                "    match:class = kitty",
+                "    border_size = 5",
+                "    no_blur = on",
+                "    opacity = 0.9",
+                "}",
+            ]
+        )
+        assert len(rules) == 1
+        assert rules[0].name == "bundle"
+        assert [e.name for e in rules[0].effects] == ["border_size", "no_blur", "opacity"]
+
+    def test_parse_disabled_named_rule(self):
+        rules = parse_window_rule_lines(
+            [
+                "windowrule {",
+                "    name = off",
+                "    enable = 0",
+                "    match:class = X",
+                "    float = on",
+                "}",
+            ]
+        )
+        assert len(rules) == 1
+        assert rules[0].name == "off"
+        assert rules[0].enabled is False
+
+    def test_anonymous_multi_effect_still_splits(self):
+        # No name → split per effect so each effect lives on its own
+        # row in the UI's one-effect-per-row model.
+        rules = parse_window_rule_lines(["windowrule = match:class kitty, opacity 0.8, no_blur on"])
+        assert len(rules) == 2
+        assert all(r.name == "" for r in rules)
+        assert [r.effects[0].name for r in rules] == ["opacity", "no_blur"]
+
+    def test_serialize_named_emits_block(self):
+        rule = WindowRule(
+            matchers=[Matcher(key="class", value="my-window")],
+            effects=[Effect(name="border_size", args="10")],
+            name="apply-something",
+        )
+        out = rule.to_line()
+        assert out == (
+            "windowrule {\n"
+            "    name = apply-something\n"
+            "    match:class = my-window\n"
+            "    border_size = 10\n"
+            "}"
+        )
+
+    def test_serialize_multi_effect_anonymous_stays_single_line(self):
+        # Anonymous multi-effect → compact single-line; Hyprland
+        # accepts multi-effect on one line, no need to inflate to block.
+        rule = WindowRule(
+            matchers=[Matcher(key="class", value="kitty")],
+            effects=[Effect(name="border_size", args="5"), Effect(name="no_blur")],
+        )
+        assert rule.to_line() == "windowrule = match:class kitty, border_size 5, no_blur on"
+
+    def test_serialize_disabled_emits_block(self):
+        rule = WindowRule(
+            matchers=[Matcher(key="class", value="X")],
+            effects=[Effect(name="float", args="on")],
+            name="off",
+            enabled=False,
+        )
+        out = rule.to_line()
+        assert "name = off" in out
+        assert "enable = 0" in out
+
+    def test_anonymous_single_effect_stays_inline(self):
+        rule = WindowRule(
+            matchers=[Matcher(key="class", value="^(firefox)$")],
+            effects=[Effect(name="float", args="on")],
+        )
+        assert rule.to_line() == "windowrule = match:class ^(firefox)$, float on"
+
+    def test_round_trip_named_block(self):
+        # End-to-end: author the block, parse via the pipeline,
+        # serialize back, verify byte-stable.
+        src = [
+            "windowrule {",
+            "    name = apply-something",
+            "    match:class = my-window",
+            "    border_size = 10",
+            "}",
+        ]
+        rules = parse_window_rule_lines(src)
+        assert len(rules) == 1
+        assert rules[0].name == "apply-something"
+        assert rules[0].to_line() == "\n".join(src)
 
 
 # ---------------------------------------------------------------------------
@@ -366,8 +520,7 @@ class TestSummaries:
     def test_summarize_action_unary(self):
         rule = WindowRule(
             matchers=[Matcher(key="class", value="^(firefox)$")],
-            effect_name="float",
-            effect_args="on",
+            effects=[Effect(name="float", args="on")],
         )
         # Boolean presets don't surface ``on`` in the summary —
         # "Float window" reads cleaner than "Float window: on".
@@ -376,8 +529,7 @@ class TestSummaries:
     def test_summarize_action_with_args(self):
         rule = WindowRule(
             matchers=[Matcher(key="class", value="^(kitty)$")],
-            effect_name="opacity",
-            effect_args="0.8 0.95",
+            effects=[Effect(name="opacity", args="0.8 0.95")],
         )
         s = summarize_action(rule)
         assert "0.8" in s
@@ -385,8 +537,7 @@ class TestSummaries:
     def test_summarize_action_custom(self):
         rule = WindowRule(
             matchers=[Matcher(key="class", value="^(foo)$")],
-            effect_name="plugin:foo:bar",
-            effect_args="baz",
+            effects=[Effect(name="plugin:foo:bar", args="baz")],
         )
         s = summarize_action(rule)
         assert "plugin:foo:bar" in s
@@ -394,8 +545,7 @@ class TestSummaries:
     def test_summarize_rule_returns_pair(self):
         rule = WindowRule(
             matchers=[Matcher(key="class", value="^(firefox)$")],
-            effect_name="float",
-            effect_args="on",
+            effects=[Effect(name="float", args="on")],
         )
         title, subtitle = summarize_rule(rule)
         assert title == "Float window"
@@ -429,8 +579,7 @@ class TestDropTargetIdx:
 def _rule(effect: str, cls: str = "x", args: str = "on") -> WindowRule:
     return WindowRule(
         matchers=[Matcher(key="class", value=cls)],
-        effect_name=effect,
-        effect_args=args,
+        effects=[Effect(name=effect, args=args)],
     )
 
 
@@ -516,7 +665,9 @@ def test_write_keyword_is_v3():
     # use the v3 keyword.
     from hyprmod.core import config
 
-    rule = WindowRule(matchers=[Matcher(key="class", value="kitty")], effect_name="float")
+    rule = WindowRule(
+        matchers=[Matcher(key="class", value="kitty")], effects=[Effect(name="float")]
+    )
     assert rule.to_line().startswith(f"{config.KEYWORD_WINDOWRULE} = ")
     assert config.KEYWORD_WINDOWRULE == "windowrule"
 
@@ -532,7 +683,7 @@ def _rule_with_matchers(*matchers: Matcher) -> WindowRule:
     The effect doesn't matter for ``matches_hyprmod`` checks (it only
     looks at matchers); ``float on`` is the simplest valid choice.
     """
-    return WindowRule(matchers=list(matchers), effect_name="float", effect_args="on")
+    return WindowRule(matchers=list(matchers), effects=[Effect(name="float", args="on")])
 
 
 class TestMatchesHyprmod:
@@ -755,7 +906,7 @@ class TestMatchesWindow:
         assert not matches_window(rule, _window(class_name="firefox", title="Bookmarks"))
 
     def test_no_matchers_does_not_match(self):
-        rule = WindowRule(matchers=[], effect_name="float", effect_args="on")
+        rule = WindowRule(matchers=[], effects=[Effect(name="float", args="on")])
         assert not matches_window(rule, _window())
 
     def test_unknown_matcher_does_not_match(self):
@@ -777,31 +928,31 @@ def _addr(window: Window) -> str:
 
 class TestExistingWindowDispatchers:
     def test_float_on_tiled_window_toggles(self):
-        rule = WindowRule([Matcher("class", "^(x)$")], "float", "on")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="float", args="on")])
         win = _window(floating=False)
         assert existing_window_dispatchers(rule, win) == [("togglefloating", _addr(win))]
 
     def test_float_on_already_floating_is_noop(self):
-        rule = WindowRule([Matcher("class", "^(x)$")], "float", "on")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="float", args="on")])
         assert existing_window_dispatchers(rule, _window(floating=True)) == []
 
     def test_tile_on_floating_window_toggles(self):
-        rule = WindowRule([Matcher("class", "^(x)$")], "tile", "on")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="tile", args="on")])
         win = _window(floating=True)
         assert existing_window_dispatchers(rule, win) == [("togglefloating", _addr(win))]
 
     def test_tile_on_tiled_is_noop(self):
-        rule = WindowRule([Matcher("class", "^(x)$")], "tile", "on")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="tile", args="on")])
         assert existing_window_dispatchers(rule, _window(floating=False)) == []
 
     def test_pin_only_when_unpinned(self):
-        rule = WindowRule([Matcher("class", "^(x)$")], "pin", "on")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="pin", args="on")])
         win = _window(pinned=False)
         assert existing_window_dispatchers(rule, win) == [("pin", _addr(win))]
         assert existing_window_dispatchers(rule, _window(pinned=True)) == []
 
     def test_workspace_uses_silent_variant(self):
-        rule = WindowRule([Matcher("class", "^(x)$")], "workspace", "2")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="workspace", args="2")])
         win = _window()
         assert existing_window_dispatchers(rule, win) == [
             ("movetoworkspacesilent", f"2,{_addr(win)}")
@@ -810,14 +961,14 @@ class TestExistingWindowDispatchers:
     def test_workspace_strips_extra_modifiers(self):
         # ``workspace 2 silent`` in a rule still works; the dispatcher
         # arg drops anything past the first whitespace token.
-        rule = WindowRule([Matcher("class", "^(x)$")], "workspace", "2 silent")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="workspace", args="2 silent")])
         win = _window()
         assert existing_window_dispatchers(rule, win) == [
             ("movetoworkspacesilent", f"2,{_addr(win)}")
         ]
 
     def test_size_emits_resize_pixel(self):
-        rule = WindowRule([Matcher("class", "^(x)$")], "size", "1280 720")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="size", args="1280 720")])
         win = _window()
         assert existing_window_dispatchers(rule, win) == [
             ("resizewindowpixel", f"exact 1280 720,{_addr(win)}")
@@ -826,29 +977,29 @@ class TestExistingWindowDispatchers:
     def test_size_with_one_arg_skips(self):
         # Malformed size args are tolerated — Hyprland would reject
         # the rule too, but we don't want to send a broken dispatch.
-        rule = WindowRule([Matcher("class", "^(x)$")], "size", "1280")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="size", args="1280")])
         assert existing_window_dispatchers(rule, _window()) == []
 
     def test_move_emits_move_pixel(self):
-        rule = WindowRule([Matcher("class", "^(x)$")], "move", "100 200")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="move", args="100 200")])
         win = _window()
         assert existing_window_dispatchers(rule, win) == [
             ("movewindowpixel", f"exact 100 200,{_addr(win)}")
         ]
 
     def test_fullscreen_skips_when_already_fullscreen(self):
-        rule = WindowRule([Matcher("class", "^(x)$")], "fullscreen", "on")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="fullscreen", args="on")])
         assert existing_window_dispatchers(rule, _window(fullscreen=2)) == []
 
     def test_maximize_skips_when_already_maximized(self):
-        rule = WindowRule([Matcher("class", "^(x)$")], "maximize", "on")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="maximize", args="on")])
         assert existing_window_dispatchers(rule, _window(fullscreen=1)) == []
 
     def test_opacity_single_value_sets_active_and_inactive(self):
         # ``opacity 0.5`` applies the same value to active+inactive,
         # mirroring Hyprland's at-spawn behaviour. Each ``setprop``
         # takes a single float, so multi-arg rules fan out.
-        rule = WindowRule([Matcher("class", "^(x)$")], "opacity", "0.5")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="opacity", args="0.5")])
         win = _window()
         addr = _addr(win)
         assert existing_window_dispatchers(rule, win) == [
@@ -857,7 +1008,7 @@ class TestExistingWindowDispatchers:
         ]
 
     def test_opacity_two_values(self):
-        rule = WindowRule([Matcher("class", "^(x)$")], "opacity", "0.5 0.8")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="opacity", args="0.5 0.8")])
         win = _window()
         addr = _addr(win)
         assert existing_window_dispatchers(rule, win) == [
@@ -866,7 +1017,7 @@ class TestExistingWindowDispatchers:
         ]
 
     def test_opacity_three_values_includes_fullscreen(self):
-        rule = WindowRule([Matcher("class", "^(x)$")], "opacity", "0.5 0.8 1.0")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="opacity", args="0.5 0.8 1.0")])
         win = _window()
         addr = _addr(win)
         assert existing_window_dispatchers(rule, win) == [
@@ -879,7 +1030,9 @@ class TestExistingWindowDispatchers:
         # ``opacity 0.5 override`` is valid Hyprland but the setprop
         # interface separates the override flag into its own props.
         # We surface the alpha values only and skip the flag for now.
-        rule = WindowRule([Matcher("class", "^(x)$")], "opacity", "0.5 override")
+        rule = WindowRule(
+            [Matcher("class", "^(x)$")], [Effect(name="opacity", args="0.5 override")]
+        )
         win = _window()
         addr = _addr(win)
         assert existing_window_dispatchers(rule, win) == [
@@ -891,21 +1044,21 @@ class TestExistingWindowDispatchers:
         # In Hyprland 0.54+ the setprop name *is* the v3 effect name,
         # so the value passes through unchanged (parsePropTrivial
         # accepts ``on`` as a truthy string).
-        rule = WindowRule([Matcher("class", "^(x)$")], "no_blur", "on")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="no_blur", args="on")])
         win = _window()
         assert existing_window_dispatchers(rule, win) == [
             ("setprop", f"{_addr(win)} no_blur on"),
         ]
 
     def test_no_shadow_passthrough(self):
-        rule = WindowRule([Matcher("class", "^(x)$")], "no_shadow", "on")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="no_shadow", args="on")])
         win = _window()
         assert existing_window_dispatchers(rule, win) == [
             ("setprop", f"{_addr(win)} no_shadow on"),
         ]
 
     def test_rounding_passthrough(self):
-        rule = WindowRule([Matcher("class", "^(x)$")], "rounding", "8")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="rounding", args="8")])
         win = _window()
         assert existing_window_dispatchers(rule, win) == [
             ("setprop", f"{_addr(win)} rounding 8"),
@@ -914,7 +1067,9 @@ class TestExistingWindowDispatchers:
     def test_border_color_emits_active_and_inactive(self):
         # ``border_color`` rule sets both gradients in Hyprland; we
         # mirror that with two setprops.
-        rule = WindowRule([Matcher("class", "^(x)$")], "border_color", "rgb(ff0000)")
+        rule = WindowRule(
+            [Matcher("class", "^(x)$")], [Effect(name="border_color", args="rgb(ff0000)")]
+        )
         win = _window()
         addr = _addr(win)
         assert existing_window_dispatchers(rule, win) == [
@@ -923,7 +1078,7 @@ class TestExistingWindowDispatchers:
         ]
 
     def test_xray_passthrough(self):
-        rule = WindowRule([Matcher("class", "^(x)$")], "xray", "on")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="xray", args="on")])
         win = _window()
         assert existing_window_dispatchers(rule, win) == [
             ("setprop", f"{_addr(win)} xray on"),
@@ -934,7 +1089,7 @@ class TestExistingWindowDispatchers:
         # has lastArgNo=3) and uses ``PRIORITY_SET_PROP`` for
         # persistence. Adding a ``lock`` keyword would be silently
         # discarded — we drop it to keep the IPC string honest.
-        rule = WindowRule([Matcher("class", "^(x)$")], "no_blur", "on")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="no_blur", args="on")])
         for _, arg in existing_window_dispatchers(rule, _window()):
             assert " lock" not in arg, f"unexpected lock in {arg!r}"
 
@@ -951,7 +1106,7 @@ class TestExistingWindowDispatchers:
             "max_size",
             "tag",
         ):
-            rule = WindowRule([Matcher("class", "^(x)$")], effect, "on")
+            rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name=effect, args="on")])
             assert existing_window_dispatchers(rule, _window()) == [], (
                 f"{effect} unexpectedly emitted a dispatcher"
             )
@@ -988,7 +1143,7 @@ class TestExistingWindowDispatchers:
         }
         for effect in RETROACTIVE_EFFECTS:
             args = per_effect_args.get(effect, "on")
-            rule = WindowRule([Matcher("class", "^(x)$")], effect, args)
+            rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name=effect, args=args)])
             state = per_effect_state.get(effect, {})
             assert existing_window_dispatchers(rule, _window(**state)), (
                 f"{effect} listed in RETROACTIVE_EFFECTS but emitted no dispatcher"
@@ -1008,7 +1163,7 @@ class TestExistingWindowRevertDispatchers:
         # mirrors the apply path: 1-arg rule emits 2 setprops, so
         # revert emits 2 — *not* 3 — to avoid locking
         # ``opacity_fullscreen`` to 1.0 when the rule never set it.
-        rule = WindowRule([Matcher("class", "^(x)$")], "opacity", "0.5")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="opacity", args="0.5")])
         win = _window()
         addr = _addr(win)
         assert existing_window_revert_dispatchers(rule, win) == [
@@ -1017,7 +1172,7 @@ class TestExistingWindowRevertDispatchers:
         ]
 
     def test_opacity_two_args_reverts_two_props(self):
-        rule = WindowRule([Matcher("class", "^(x)$")], "opacity", "0.5 0.8")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="opacity", args="0.5 0.8")])
         win = _window()
         addr = _addr(win)
         assert existing_window_revert_dispatchers(rule, win) == [
@@ -1026,7 +1181,7 @@ class TestExistingWindowRevertDispatchers:
         ]
 
     def test_opacity_three_args_reverts_three_props(self):
-        rule = WindowRule([Matcher("class", "^(x)$")], "opacity", "0.5 0.8 1.0")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="opacity", args="0.5 0.8 1.0")])
         win = _window()
         addr = _addr(win)
         assert existing_window_revert_dispatchers(rule, win) == [
@@ -1038,7 +1193,9 @@ class TestExistingWindowRevertDispatchers:
     def test_opacity_override_keyword_dropped_in_revert_too(self):
         # ``opacity 0.5 override`` apply emits 2 setprops; revert
         # mirrors that count, ignoring the keyword.
-        rule = WindowRule([Matcher("class", "^(x)$")], "opacity", "0.5 override")
+        rule = WindowRule(
+            [Matcher("class", "^(x)$")], [Effect(name="opacity", args="0.5 override")]
+        )
         win = _window()
         addr = _addr(win)
         assert existing_window_revert_dispatchers(rule, win) == [
@@ -1050,14 +1207,14 @@ class TestExistingWindowRevertDispatchers:
         # Bool effects flow through ``parsePropTrivial`` which DOES
         # accept ``unset`` — that's the cleanest revert (clears the
         # SET_PROP override entirely, lets the rule resolver retake).
-        rule = WindowRule([Matcher("class", "^(x)$")], "no_blur", "on")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="no_blur", args="on")])
         win = _window()
         assert existing_window_revert_dispatchers(rule, win) == [
             ("setprop", f"{_addr(win)} no_blur unset"),
         ]
 
     def test_rounding_reverts_via_unset(self):
-        rule = WindowRule([Matcher("class", "^(x)$")], "rounding", "8")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="rounding", args="8")])
         win = _window()
         assert existing_window_revert_dispatchers(rule, win) == [
             ("setprop", f"{_addr(win)} rounding unset"),
@@ -1067,7 +1224,9 @@ class TestExistingWindowRevertDispatchers:
         # ``setprop active_border_color unset`` in 0.54.3 ends up
         # storing an empty gradient at SET_PROP — equivalent to "no
         # override" for our purposes.
-        rule = WindowRule([Matcher("class", "^(x)$")], "border_color", "rgb(ff0000)")
+        rule = WindowRule(
+            [Matcher("class", "^(x)$")], [Effect(name="border_color", args="rgb(ff0000)")]
+        )
         win = _window()
         addr = _addr(win)
         assert existing_window_revert_dispatchers(rule, win) == [
@@ -1075,23 +1234,38 @@ class TestExistingWindowRevertDispatchers:
             ("setprop", f"{addr} inactive_border_color unset"),
         ]
 
-    def test_static_effects_have_no_clean_revert(self):
-        # ``float``/``size``/``workspace``/etc. mutate the window's
-        # actual layout state; safely undoing them needs per-window
-        # history we don't track. The user's escape hatch is
-        # save+reload.
+    def test_toggleable_static_effects_revert_via_inverse_toggle(self):
+        # ``float``/``tile``/``pin``/``fullscreen``/``maximize`` get a
+        # best-effort inverse toggle when the window is currently in
+        # the rule's target state — mirrors the apply path's symmetric
+        # false-positive trade-off (we can't tell whether the rule put
+        # the window there or the user did).
+        addr = _addr(_window())
+        cases = [
+            ("float", "on", _window(floating=True), [("togglefloating", addr)]),
+            ("float", "on", _window(floating=False), []),
+            ("tile", "on", _window(floating=False), [("togglefloating", addr)]),
+            ("pin", "on", _window(pinned=True), [("pin", addr)]),
+            ("fullscreen", "on", _window(fullscreen=2), [("fullscreenstate", f"0 -1,{addr}")]),
+            ("maximize", "on", _window(fullscreen=1), [("fullscreenstate", f"0 -1,{addr}")]),
+        ]
+        for effect, args, win, expected in cases:
+            rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name=effect, args=args)])
+            assert existing_window_revert_dispatchers(rule, win) == expected, (
+                f"{effect} produced unexpected revert"
+            )
+
+    def test_unrevertable_static_effects_stay_noop(self):
+        # ``size``/``move``/``workspace``/``monitor`` mutate layout state
+        # without an inverse we can compute from current state alone —
+        # no "previous size" history. Save+reload is the escape hatch.
         for effect, args in [
-            ("float", "on"),
-            ("tile", "on"),
-            ("pin", "on"),
-            ("fullscreen", "on"),
-            ("maximize", "on"),
             ("workspace", "2"),
             ("monitor", "DP-1"),
             ("size", "100 100"),
             ("move", "0 0"),
         ]:
-            rule = WindowRule([Matcher("class", "^(x)$")], effect, args)
+            rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name=effect, args=args)])
             assert existing_window_revert_dispatchers(rule, _window()) == [], (
                 f"{effect} unexpectedly emitted a revert dispatcher"
             )
@@ -1121,7 +1295,7 @@ class TestExistingWindowRevertDispatchers:
             if effect in static_effects:
                 continue
             args = per_effect_args.get(effect, "on")
-            rule = WindowRule([Matcher("class", "^(x)$")], effect, args)
+            rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name=effect, args=args)])
             applied = {
                 arg.split()[1] for _disp, arg in existing_window_dispatchers(rule, _window())
             }
@@ -1242,7 +1416,7 @@ class TestLoadExternalWindowRules:
     def test_external_rule_dataclass_is_immutable(self):
         # Frozen dataclass — defensively checked because the page
         # caches the list and would break if rules mutated under it.
-        rule = WindowRule([Matcher("class", "^(x)$")], "opacity", "0.5")
+        rule = WindowRule([Matcher("class", "^(x)$")], [Effect(name="opacity", args="0.5")])
         ext = ExternalWindowRule(rule=rule, source_path=Path("/x.conf"), lineno=1)
         with pytest.raises((AttributeError, TypeError)):
             ext.lineno = 2  # type: ignore[misc]

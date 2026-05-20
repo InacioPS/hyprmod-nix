@@ -34,7 +34,7 @@ def _make_window(get_all_results: list[list[MonitorState]]) -> SimpleNamespace:
     hypr = SimpleNamespace(monitors=monitors, on_change=MagicMock(), document=None)
     # Pages now read managed sections through ``window.saved_sections``
     # rather than re-parsing per call; mirror that by reading once here.
-    _, saved_sections = config.read_all_sections()
+    _, saved_sections, _rules = config.read_all_sections()
     return SimpleNamespace(
         hypr=hypr,
         show_toast=MagicMock(),

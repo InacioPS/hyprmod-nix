@@ -21,6 +21,7 @@ from hyprland_config import (
     Document,
     Keyword,
     ParseError,
+    Rule,
     atomic_write,
     check_deprecated,
     default_hyprlang_entrypoint,
@@ -305,17 +306,26 @@ def _is_managed_keyword(name: str) -> bool:
 
 def read_all_sections(
     path: Path | None = None,
-) -> tuple[dict[str, str], dict[str, list[str]]]:
+) -> tuple[dict[str, str], dict[str, list[str]], list[Rule]]:
     """Single-pass parse of the managed config file.
 
-    Returns ``(options, sections)`` — values for regular option lines and
-    raw lines per special keyword (bind, monitor, …). Deprecated syntax
-    is rewritten in-memory before collection, so hyprmod always sees the
-    current shape regardless of the on-disk format.
+    Returns ``(options, sections, rules)``:
+
+    - ``options`` — values for regular option lines (``general:gaps_in``, …).
+    - ``sections`` — raw lines per special keyword (``bind``, ``monitor``,
+      ``env``, …), in the order they appear on disk.
+    - ``rules`` — structured :class:`Rule` nodes for windowrule / layerrule
+      entries. Both source shapes (single-line ``windowrule = …`` and
+      block-form ``windowrule { … }``) normalise into this list via
+      :func:`hyprland_config.migrate`, so consumers iterate matchers /
+      effects / name / enabled directly instead of re-parsing strings.
+
+    Deprecated syntax is rewritten in-memory before collection, so
+    hyprmod always sees the current shape regardless of the on-disk format.
     """
     path = path or managed_path()
     if not path.exists():
-        return {}, {}
+        return {}, {}, []
     doc = load_any(path, follow_sources=False, lenient=True)
     # In-memory only — keeps the UI consistent when the on-disk file still
     # uses legacy syntax. Persisting the migration requires user consent
@@ -323,12 +333,15 @@ def read_all_sections(
     migrate(doc)
     options: dict[str, str] = {}
     sections: dict[str, list[str]] = {}
+    rules: list[Rule] = []
     for line in doc.lines:
         if isinstance(line, Assignment):
             options[line.full_key] = line.value
         elif isinstance(line, Keyword) and _is_managed_keyword(line.key):
             sections.setdefault(line.key, []).append(line.raw.strip())
-    return options, sections
+        elif isinstance(line, Rule):
+            rules.append(line)
+    return options, sections, rules
 
 
 def collect_section(sections: dict[str, list[str]], *keys: str) -> list[str]:
@@ -358,11 +371,11 @@ def collect_bind_section(sections: dict[str, list[str]]) -> list[str]:
 # every rebuild; in Lua mode this matters in particular because parsing
 # spawns a Lua subprocess.
 
-_cached_state: tuple[Path, dict[str, str], dict[str, list[str]]] | None = None
+_cached_state: tuple[Path, dict[str, str], dict[str, list[str]], list[Rule]] | None = None
 
 
-def read_cached() -> tuple[dict[str, str], dict[str, list[str]]]:
-    """Return the cached ``(options, sections)`` parse of the managed file.
+def read_cached() -> tuple[dict[str, str], dict[str, list[str]], list[Rule]]:
+    """Return the cached ``(options, sections, rules)`` parse of the managed file.
 
     Re-reads from disk on path change or after :func:`invalidate_cache`.
     Callers that need to react to a fresh write should invalidate first.
@@ -370,10 +383,10 @@ def read_cached() -> tuple[dict[str, str], dict[str, list[str]]]:
     global _cached_state
     path = managed_path()
     if _cached_state is not None and _cached_state[0] == path:
-        return _cached_state[1], _cached_state[2]
-    values, sections = read_all_sections(path)
-    _cached_state = (path, values, sections)
-    return values, sections
+        return _cached_state[1], _cached_state[2], _cached_state[3]
+    values, sections, rules = read_all_sections(path)
+    _cached_state = (path, values, sections, rules)
+    return values, sections, rules
 
 
 def invalidate_cache() -> None:

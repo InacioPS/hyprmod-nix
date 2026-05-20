@@ -23,6 +23,7 @@ import re
 from collections.abc import Callable
 
 from gi.repository import Adw, Gtk
+from hyprland_config import render_rule_hyprlang, render_rule_lua
 from hyprland_socket import Window
 
 from hyprmod.core import config
@@ -35,13 +36,14 @@ from hyprmod.core.window_rules import (
     RAW_KEY,
     ActionField,
     ActionPreset,
+    Effect,
     Matcher,
     MatcherKind,
     WindowRule,
     lookup_matcher_kind,
     lookup_preset,
 )
-from hyprmod.ui import build_preview_group, format_config_preview
+from hyprmod.ui import build_preview_group
 from hyprmod.ui.dialog import SingletonDialogMixin
 from hyprmod.ui.window_picker import WindowPickerDialog
 
@@ -56,6 +58,22 @@ def _escape_regex(value: str) -> str:
     to match a family of classes.
     """
     return f"^({re.escape(value)})$"
+
+
+def _preview_for(rule: WindowRule) -> str:
+    """Render *rule* in the active mode's syntax for the dialog preview.
+
+    Builds the structured :class:`hyprland_config.Rule` node and hands
+    it to the right language-specific renderer — Lua mode picks
+    :func:`render_rule_lua` (one ``hl.window_rule({…})`` call),
+    Hyprlang mode picks :func:`render_rule_hyprlang` (block when
+    name/disabled, single-line otherwise). Both routes match what
+    would actually hit disk so the preview is byte-faithful.
+    """
+    node = rule.to_rule_node()
+    if config.is_lua_mode():
+        return render_rule_lua(node)
+    return render_rule_hyprlang(node).rstrip("\n")
 
 
 class WindowRuleEditDialog(SingletonDialogMixin, Adw.Dialog):
@@ -95,6 +113,17 @@ class WindowRuleEditDialog(SingletonDialogMixin, Adw.Dialog):
         # Live-preview label updated on every form change.
         self._preview_label: Gtk.Label
 
+        # Pass-through state for the rule's optional name and enabled
+        # flag — set via the Name section UI; preserved unchanged when
+        # editing an anonymous rule.
+        self._rule_name: str = ""
+        self._rule_enabled: bool = True
+        # Trailing effects from a multi-effect block-form rule. The
+        # dialog only edits the first effect; the rest survive a
+        # round-trip via this shadow list so opening + Apply on a
+        # multi-effect rule doesn't silently drop the extras.
+        self._extra_effects: list[Effect] = []
+
         self.set_title("New Window Rule" if self._is_new else "Edit Window Rule")
         self.set_content_width(560)
         self.set_content_height(640)
@@ -127,6 +156,7 @@ class WindowRuleEditDialog(SingletonDialogMixin, Adw.Dialog):
         content.set_margin_start(18)
         content.set_margin_end(18)
 
+        content.append(self._build_name_section())
         content.append(self._build_match_section())
         content.append(self._build_apply_section())
         content.append(self._build_preview_section())
@@ -147,6 +177,36 @@ class WindowRuleEditDialog(SingletonDialogMixin, Adw.Dialog):
         self._refresh()
 
     # ── Section builders ──────────────────────────────────────────────
+
+    def _build_name_section(self) -> Gtk.Widget:
+        """Optional ``Name`` row plus disabled toggle for block-form rules.
+
+        A name promotes the rule from anonymous to named — Hyprland's
+        Lua API and ``hyprctl`` can then reference it for dynamic
+        enable/disable. Leaving the name blank keeps the rule
+        anonymous and emits the compact single-line syntax.
+        """
+        group = Adw.PreferencesGroup(title="Name (optional)")
+        group.set_description(
+            "Naming a rule lets you enable / disable it at runtime via "
+            "Hyprland's Lua API or hyprctl. Anonymous rules are written "
+            "as the compact one-line form."
+        )
+
+        self._name_entry = Adw.EntryRow(title="Name")
+        self._name_entry.set_text(self._rule_name)
+        self._name_entry.connect("changed", self._on_name_changed)
+        group.add(self._name_entry)
+
+        self._enabled_row = Adw.SwitchRow(
+            title="Enabled",
+            subtitle="Uncheck to keep the rule defined but inactive on next reload.",
+        )
+        self._enabled_row.set_active(self._rule_enabled)
+        self._enabled_row.connect("notify::active", self._on_enabled_changed)
+        group.add(self._enabled_row)
+
+        return group
 
     def _build_match_section(self) -> Gtk.Widget:
         """The 'Match windows where…' group with matcher rows + add buttons."""
@@ -226,6 +286,23 @@ class WindowRuleEditDialog(SingletonDialogMixin, Adw.Dialog):
 
     def _load_from_rule(self, rule: WindowRule) -> None:
         """Populate widgets from an existing ``WindowRule`` for editing."""
+        # Block handler signals while seeding so the changed callbacks
+        # don't fire on hydration (they'd treat the load as a user edit
+        # and trigger a redundant preview refresh).
+        self._rule_name = rule.name
+        self._rule_enabled = rule.enabled
+        # Stash any extra effects (multi-effect block-form rule) so
+        # Apply doesn't drop them — the action picker only edits the
+        # first effect.
+        self._extra_effects = list(rule.effects[1:])
+        if hasattr(self, "_name_entry"):
+            self._name_entry.handler_block_by_func(self._on_name_changed)
+            self._name_entry.set_text(rule.name)
+            self._name_entry.handler_unblock_by_func(self._on_name_changed)
+        if hasattr(self, "_enabled_row"):
+            self._enabled_row.handler_block_by_func(self._on_enabled_changed)
+            self._enabled_row.set_active(rule.enabled)
+            self._enabled_row.handler_unblock_by_func(self._on_enabled_changed)
         # Matchers first — the dropdown field rebuild reads them when
         # computing the preview, so seeding them ahead of the effect
         # avoids a flash of "no matchers" during dialog open.
@@ -467,6 +544,14 @@ class WindowRuleEditDialog(SingletonDialogMixin, Adw.Dialog):
 
     # ── Refresh: preview + apply gating ───────────────────────────────
 
+    def _on_name_changed(self, *_args: object) -> None:
+        self._rule_name = self._name_entry.get_text().strip()
+        self._refresh()
+
+    def _on_enabled_changed(self, *_args: object) -> None:
+        self._rule_enabled = self._enabled_row.get_active()
+        self._refresh()
+
     def _on_field_changed(self, *_args: object) -> None:
         self._refresh()
 
@@ -475,9 +560,7 @@ class WindowRuleEditDialog(SingletonDialogMixin, Adw.Dialog):
         if rule is None:
             self._preview_label.set_text("(rule incomplete)")
         else:
-            self._preview_label.set_text(
-                format_config_preview(config.KEYWORD_WINDOWRULE, rule.body())
-            )
+            self._preview_label.set_text(_preview_for(rule))
         # Apply gates on a non-empty effect name AND at least one
         # non-empty matcher. This rejects both halves of an incomplete
         # rule, both of which Hyprland would reject at runtime.
@@ -518,8 +601,9 @@ class WindowRuleEditDialog(SingletonDialogMixin, Adw.Dialog):
 
         return WindowRule(
             matchers=matchers,
-            effect_name=effect_name,
-            effect_args=effect_args,
+            effects=[Effect(name=effect_name, args=effect_args), *self._extra_effects],
+            name=self._rule_name,
+            enabled=self._rule_enabled,
         )
 
     # ── Apply ─────────────────────────────────────────────────────────

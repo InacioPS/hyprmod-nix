@@ -318,20 +318,30 @@ def matches_window(rule: WindowRule, window: "Window") -> bool:
 
 
 def existing_window_dispatchers(rule: WindowRule, window: "Window") -> list[tuple[str, str]]:
-    """Dispatchers that retroactively apply *rule*'s effect to *window*.
+    """Dispatchers that retroactively apply *rule*'s effects to *window*.
 
     Adapts the page-level :class:`WindowRule` data shape to the
     library's effect-string-based interface. See
-    :func:`hyprland_state.dispatchers_for_effect` for the full per-effect
-    behaviour and the rationale behind the dispatcher choices.
+    :func:`hyprland_state.dispatchers_for_effect` for the full
+    per-effect behaviour and the rationale behind the dispatcher
+    choices. Multi-effect rules (block-form / named bundles) emit
+    dispatchers in declaration order so the visual result matches the
+    user's authored sequence.
     """
-    return dispatchers_for_effect(rule.effect_name, rule.effect_args, window)
+    result: list[tuple[str, str]] = []
+    for effect in rule.effects:
+        result.extend(dispatchers_for_effect(effect.name, effect.args, window))
+    return result
 
 
 def existing_window_revert_dispatchers(rule: WindowRule, window: "Window") -> list[tuple[str, str]]:
-    """Dispatchers that revert *rule*'s runtime effect on *window*.
+    """Dispatchers that revert *rule*'s runtime effects on *window*.
 
     Adapter around :func:`hyprland_state.revert_dispatchers_for_effect`;
-    symmetric to :func:`existing_window_dispatchers`.
+    symmetric to :func:`existing_window_dispatchers`, iterating each
+    effect in the rule so multi-effect bundles fully revert.
     """
-    return revert_dispatchers_for_effect(rule.effect_name, rule.effect_args, window)
+    result: list[tuple[str, str]] = []
+    for effect in rule.effects:
+        result.extend(revert_dispatchers_for_effect(effect.name, effect.args, window))
+    return result

@@ -568,7 +568,7 @@ class TestWriteIntegration:
                 ],
             ),
         )
-        _, sections = config.read_all_sections()
+        _, sections, _rules = config.read_all_sections()
         assert sections.get(config.KEYWORD_ENV) == [
             "env = FOO,bar",
             "env = BAZ,qux",

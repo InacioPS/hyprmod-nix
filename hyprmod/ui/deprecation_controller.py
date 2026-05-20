@@ -10,7 +10,6 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from gi.repository import Gio
-from hyprland_config import default_hyprlang_entrypoint
 
 from hyprmod.core import config, deprecations
 from hyprmod.ui import ShowToast
@@ -77,7 +76,7 @@ class DeprecationController:
         DeprecationDialog.present_singleton(
             self._window,
             managed_path=config.managed_path(),
-            user_root_path=default_hyprlang_entrypoint(),
+            user_root_path=config.user_entry_path(),
             hyprland_version=self._current_version(),
             on_done=self._on_dialog_done,
         )
@@ -93,7 +92,12 @@ class DeprecationController:
     def _scan(self) -> deprecations.ScanResult:
         return deprecations.scan(
             managed_path=config.managed_path(),
-            user_root_path=default_hyprlang_entrypoint(),
+            # Scope the scan to the file Hyprland actually loads —
+            # ``hyprland.lua`` in Lua mode, ``hyprland.conf`` in
+            # Hyprlang mode. Hard-coding the Hyprlang entry would
+            # surface ``.conf`` fragments a Lua-mode user no longer
+            # uses (Hyprland 0.55+ ignores them when the entry is .lua).
+            user_root_path=config.user_entry_path(),
             hyprland_version=self._current_version(),
         )
 

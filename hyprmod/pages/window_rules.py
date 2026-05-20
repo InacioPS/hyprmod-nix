@@ -80,16 +80,16 @@ from hyprmod.core.window_rules import (
     ACTION_PRESETS,
     HYPRMOD_APP_ID,
     RETROACTIVE_EFFECTS,
-    WINDOW_RULE_KEYWORDS,
+    Effect,
     ExternalWindowRule,
     Matcher,
     WindowRule,
     existing_window_dispatchers,
     existing_window_revert_dispatchers,
+    from_rule_nodes,
     load_external_window_rules,
     matches_hyprmod,
     matches_window,
-    parse_window_rule_lines,
     serialize,
     summarize_rule,
 )
@@ -137,18 +137,15 @@ class WindowRulesPage(SavedListSectionPage[WindowRule]):
     # ── Loading ──
 
     def _load(self, saved_sections: dict[str, list[str]] | None) -> None:
-        if saved_sections is None:
-            saved_sections = self._window.saved_sections
-        # Read both ``windowrule`` and ``windowrulev2`` so users with
-        # hand-rolled lines in either form see them in the UI. Any v2
-        # lines have already been rewritten to v3 in memory by
-        # ``hyprland_config.migrate()`` upstream in ``read_all_sections``,
-        # so the ``windowrulev2`` bucket is normally empty — collecting
-        # it is just defence in depth for callers that pass us a
-        # pre-built ``saved_sections`` from an unmigrated source. The
-        # write path always emits v3 ``windowrule``.
-        raw_lines = config.collect_section(saved_sections, *WINDOW_RULE_KEYWORDS)
-        items = parse_window_rule_lines(raw_lines)
+        # Window rules come through as structured :class:`Rule` nodes
+        # from ``hyprland_config.migrate()`` regardless of source shape
+        # (single-line, block-form, or Lua table); the page-level
+        # adapter converts them to UI :class:`WindowRule` entries.
+        # ``saved_sections`` is no longer load-bearing for windowrules
+        # — kept on the constructor for the shared base-class contract
+        # other pages still use.
+        del saved_sections
+        items = from_rule_nodes(self._window.saved_rules)
         self._owned = SavedList(items, key=lambda r: r.to_line())
         # Surface any windowrule lines that live in the user's
         # hyprland.conf or any file it sources (other than our managed
@@ -311,7 +308,7 @@ class WindowRulesPage(SavedListSectionPage[WindowRule]):
     def _apply_rule_live(self, rule: WindowRule) -> bool:
         """Apply *rule* to the running compositor.
 
-        Two-step:
+        Two-step for enabled rules:
 
         1. ``hypr.keyword("windowrule", …)`` registers the rule so
            future windows pick it up.
@@ -322,9 +319,13 @@ class WindowRulesPage(SavedListSectionPage[WindowRule]):
            arrives via IPC, so this step is what makes opacity / float
            / etc. visible on the windows the user already has open.
 
-        Returns ``True`` if the keyword push succeeded (a toast has
-        already been shown on failure).
+        Disabled rules (``enabled=False``) skip both steps — the
+        user's intent is "defined but inactive", and pushing the
+        keyword would activate it until the next reload. Returns
+        ``True`` when the rule was actually pushed.
         """
+        if not rule.enabled:
+            return False
         ok = try_with_toast(
             self._window.show_toast,
             "Window rule failed",
@@ -378,13 +379,14 @@ class WindowRulesPage(SavedListSectionPage[WindowRule]):
         return applied, first_error
 
     def _apply_to_existing(self, rule: WindowRule) -> None:
-        """Replicate *rule*'s effect on each already-mapped match.
+        """Replicate *rule*'s effects on each already-mapped match.
 
-        Bails immediately for effects we have no per-window mapping
-        for, so we don't pay for an IPC ``get_windows`` round-trip
-        on every (e.g.) ``stay_focused`` tweak.
+        Bails immediately when no effect in the rule has a per-window
+        mapping, so we don't pay for an IPC ``get_windows`` round-trip
+        on (e.g.) a ``stay_focused``-only tweak. Multi-effect rules
+        run if *any* effect is retroactive.
         """
-        if rule.effect_name not in RETROACTIVE_EFFECTS:
+        if not any(e.name in RETROACTIVE_EFFECTS for e in rule.effects):
             return
         applied, error = self._foreach_matching_window(rule, existing_window_dispatchers)
         if error is not None:
@@ -410,7 +412,7 @@ class WindowRulesPage(SavedListSectionPage[WindowRule]):
         back to its prior opacity/blur/etc. Errors are surfaced because
         a silent failure here is the bug we're fixing.
         """
-        if rule.effect_name not in RETROACTIVE_EFFECTS:
+        if not any(e.name in RETROACTIVE_EFFECTS for e in rule.effects):
             return
         _applied, error = self._foreach_matching_window(rule, existing_window_revert_dispatchers)
         if error is not None:
@@ -501,12 +503,11 @@ class WindowRulesPage(SavedListSectionPage[WindowRule]):
                 # than a blank dialog when class is unknown.
                 matchers.append(Matcher(key="title", value=f"^({re.escape(window.title)})$"))
             # Float is a non-destructive default that users almost
-            # always change. ``effect_args=""`` triggers the auto-``on``
-            # for booleans on serialization.
+            # always change. Empty args triggers the auto-``on`` for
+            # booleans on serialization.
             stub = WindowRule(
                 matchers=matchers,
-                effect_name=ACTION_PRESETS[0].id,
-                effect_args="",
+                effects=[Effect(name=ACTION_PRESETS[0].id)],
             )
 
             def on_apply(new_rule: WindowRule) -> None:
@@ -526,6 +527,13 @@ class WindowRulesPage(SavedListSectionPage[WindowRule]):
             if new_rule == current:
                 return
             self._commit_replaced(idx, new_rule)
+            # Toggling Enabled off needs to undo the prior live effect on
+            # already-mapped windows — Hyprland doesn't retroactively
+            # "un-float" / clear setprop when a rule is disabled at
+            # config-edit time. Skip the apply step in that case.
+            if current.enabled and not new_rule.enabled:
+                self._revert_to_existing(current)
+                return
             self._maybe_apply_rule_live(new_rule)
 
         WindowRuleEditDialog.present_singleton(self._window, rule=current, on_apply=on_apply)
@@ -595,11 +603,6 @@ class WindowRulesPage(SavedListSectionPage[WindowRule]):
         order users see in the UI is exactly what's written.
         """
         return serialize(list(self._owned))
-
-    @staticmethod
-    def has_managed_section(sections: dict[str, list[str]]) -> bool:
-        """True if the saved config already contains any window-rule lines."""
-        return any(sections.get(kw) for kw in WINDOW_RULE_KEYWORDS)
 
 
 __all__ = ["WindowRulesPage"]

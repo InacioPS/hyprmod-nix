@@ -155,12 +155,12 @@ class TestReadAllSectionsRoundTrip:
 
     def test_lua_round_trip_options(self, lua_mode) -> None:
         config.write_all({"general:gaps_in": "5"}, config.ConfigSections())
-        options, _sections = config.read_all_sections()
+        options, _sections, _rules = config.read_all_sections()
         assert options.get("general:gaps_in") == "5"
 
     def test_lua_round_trip_keyword_section(self, lua_mode) -> None:
         config.write_all({}, config.ConfigSections(env=["env = XCURSOR_SIZE, 24\n"]))
-        _options, sections = config.read_all_sections()
+        _options, sections, _rules = config.read_all_sections()
         # Lua reader synthesises Hyprlang-style raw lines, so the
         # collected env section matches what we'd see in Hyprlang mode.
         env_lines = sections.get("env", [])

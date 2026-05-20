@@ -32,6 +32,7 @@ from hyprmod.core.layer_rules import (
     LAYER_ACTION_PRESETS_BY_ID,
     LAYER_BOOL_EFFECTS,
     LAYER_RULE_KEYWORDS,
+    LayerEffect,
     LayerRule,
     load_external_layer_rules,
     lookup_preset,
@@ -52,7 +53,9 @@ from hyprmod.core.ownership import SavedList
 class TestParseV3:
     def test_basic_blur(self):
         rule = parse_layer_rule_line("layerrule = match:namespace ^(waybar)$, blur on")
-        assert rule == LayerRule(namespace="^(waybar)$", rule_name="blur", rule_args="on")
+        assert rule == LayerRule(
+            namespace="^(waybar)$", effects=[LayerEffect(name="blur", args="on")]
+        )
 
     def test_match_first_or_last_both_work(self):
         a = parse_layer_rule_line("layerrule = match:namespace ^(waybar)$, blur on")
@@ -63,19 +66,27 @@ class TestParseV3:
 
     def test_one_arg_float(self):
         rule = parse_layer_rule_line("layerrule = match:namespace waybar, ignore_alpha 0.30")
-        assert rule == LayerRule(namespace="waybar", rule_name="ignore_alpha", rule_args="0.30")
+        assert rule == LayerRule(
+            namespace="waybar", effects=[LayerEffect(name="ignore_alpha", args="0.30")]
+        )
 
     def test_one_arg_int(self):
         rule = parse_layer_rule_line("layerrule = match:namespace notifications, order 5")
-        assert rule == LayerRule(namespace="notifications", rule_name="order", rule_args="5")
+        assert rule == LayerRule(
+            namespace="notifications", effects=[LayerEffect(name="order", args="5")]
+        )
 
     def test_animation_string_arg(self):
         rule = parse_layer_rule_line("layerrule = match:namespace waybar, animation slide")
-        assert rule == LayerRule(namespace="waybar", rule_name="animation", rule_args="slide")
+        assert rule == LayerRule(
+            namespace="waybar", effects=[LayerEffect(name="animation", args="slide")]
+        )
 
     def test_above_lock(self):
         rule = parse_layer_rule_line("layerrule = match:namespace lock-prompt, above_lock 1")
-        assert rule == LayerRule(namespace="lock-prompt", rule_name="above_lock", rule_args="1")
+        assert rule == LayerRule(
+            namespace="lock-prompt", effects=[LayerEffect(name="above_lock", args="1")]
+        )
 
     def test_regex_namespace_with_alternation(self):
         rule = parse_layer_rule_line("layerrule = match:namespace ^(rofi|wofi)$, dim_around on")
@@ -227,9 +238,9 @@ class TestRoundTrip:
 
     def test_serialize_list(self):
         rules = [
-            LayerRule(namespace="waybar", rule_name="blur", rule_args="on"),
-            LayerRule(namespace="waybar", rule_name="ignore_alpha", rule_args="0.30"),
-            LayerRule(namespace="^(rofi)$", rule_name="dim_around", rule_args="on"),
+            LayerRule(namespace="waybar", effects=[LayerEffect(name="blur", args="on")]),
+            LayerRule(namespace="waybar", effects=[LayerEffect(name="ignore_alpha", args="0.30")]),
+            LayerRule(namespace="^(rofi)$", effects=[LayerEffect(name="dim_around", args="on")]),
         ]
         assert serialize(rules) == [
             "layerrule = match:namespace waybar, blur on",
@@ -241,28 +252,119 @@ class TestRoundTrip:
         # Building a LayerRule with empty rule_args for a bool effect
         # auto-fills ``on`` on serialization — Hyprland 0.54.3 rejects
         # bare bool effects with "missing a value".
-        rule = LayerRule(namespace="waybar", rule_name="blur")
+        rule = LayerRule(namespace="waybar", effects=[LayerEffect(name="blur")])
         assert rule.to_line().endswith(", blur on")
 
     def test_non_bool_effect_no_auto_on(self):
         # Numeric/string effects keep their explicit args and don't
         # gain a spurious ``on``.
-        rule = LayerRule(namespace="waybar", rule_name="ignore_alpha", rule_args="0.5")
+        rule = LayerRule(namespace="waybar", effects=[LayerEffect(name="ignore_alpha", args="0.5")])
         assert rule.to_line().endswith(", ignore_alpha 0.5")
 
     def test_unknown_rule_round_trips(self):
-        rule = LayerRule(namespace="waybar", rule_name="plugin:foo", rule_args="bar baz")
+        rule = LayerRule(
+            namespace="waybar", effects=[LayerEffect(name="plugin:foo", args="bar baz")]
+        )
         line = rule.to_line()
         assert parse_layer_rule_line(line) == rule
 
     def test_regex_with_parens_round_trips(self):
         # The parens-aware top-level split keeps ``^(rofi|wofi)$`` intact
         # even though it contains characters the parser is split on.
-        rule = LayerRule(namespace="^(rofi|wofi)$", rule_name="dim_around")
+        rule = LayerRule(namespace="^(rofi|wofi)$", effects=[LayerEffect(name="dim_around")])
         line = rule.to_line()
         parsed = parse_layer_rule_line(line)
         assert parsed is not None
         assert parsed.namespace == "^(rofi|wofi)$"
+
+
+class TestNamedBlockLayerRules:
+    """Named / block-form layerrules — read via the structured
+    :class:`hyprland_config.Rule` node and the
+    :func:`hyprmod.core.layer_rules.from_rule_node` adapter.
+    """
+
+    def test_parse_named_single_effect(self):
+        from hyprland_config import Rule, migrate, parse_string
+
+        from hyprmod.core.layer_rules import from_rule_nodes
+
+        doc = parse_string(
+            "layerrule {\n"
+            "    name = no-anim-selection\n"
+            "    match:namespace = selection\n"
+            "    no_anim = on\n"
+            "}\n"
+        )
+        migrate(doc)
+        rules = from_rule_nodes([ln for ln in doc.lines if isinstance(ln, Rule)])
+        assert len(rules) == 1
+        assert rules[0].name == "no-anim-selection"
+        assert rules[0].enabled is True
+        assert rules[0].namespace == "selection"
+        assert rules[0].effects == [LayerEffect(name="no_anim", args="on")]
+
+    def test_parse_named_multi_effect_stays_bundled(self):
+        from hyprland_config import Rule, migrate, parse_string
+
+        from hyprmod.core.layer_rules import from_rule_nodes
+
+        doc = parse_string(
+            "layerrule {\n"
+            "    name = bundle\n"
+            "    match:namespace = ^(waybar)$\n"
+            "    blur = on\n"
+            "    ignore_alpha = 0.5\n"
+            "}\n"
+        )
+        migrate(doc)
+        rules = from_rule_nodes([ln for ln in doc.lines if isinstance(ln, Rule)])
+        assert len(rules) == 1
+        assert rules[0].name == "bundle"
+        assert [e.name for e in rules[0].effects] == ["blur", "ignore_alpha"]
+
+    def test_anonymous_multi_effect_still_splits(self):
+        rules = parse_layer_rule_lines(
+            ["layerrule = match:namespace ^(waybar)$, blur on, ignore_alpha 0.5"]
+        )
+        assert len(rules) == 2
+        assert all(r.name == "" for r in rules)
+        assert [r.effects[0].name for r in rules] == ["blur", "ignore_alpha"]
+
+    def test_serialize_named_emits_block(self):
+        rule = LayerRule(
+            namespace="selection",
+            effects=[LayerEffect(name="no_anim", args="on")],
+            name="no-anim-selection",
+        )
+        out = rule.to_line()
+        assert out == (
+            "layerrule {\n"
+            "    name = no-anim-selection\n"
+            "    match:namespace = selection\n"
+            "    no_anim = on\n"
+            "}"
+        )
+
+    def test_serialize_multi_effect_anonymous_stays_single_line(self):
+        # Anonymous multi-effect → single-line; Hyprland accepts
+        # multi-effect on one line, no need to inflate to block.
+        rule = LayerRule(
+            namespace="^(waybar)$",
+            effects=[LayerEffect(name="blur"), LayerEffect(name="ignore_alpha", args="0.5")],
+        )
+        assert rule.to_line() == "layerrule = match:namespace ^(waybar)$, blur on, ignore_alpha 0.5"
+
+    def test_serialize_disabled_emits_block(self):
+        rule = LayerRule(
+            namespace="waybar",
+            effects=[LayerEffect(name="blur", args="on")],
+            name="off",
+            enabled=False,
+        )
+        out = rule.to_line()
+        assert "name = off" in out
+        assert "enable = 0" in out
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +379,7 @@ class TestKeywords:
     def test_serialized_lines_use_layerrule(self):
         # Hyprland 0.54+: write keyword is ``layerrule``. Round-tripping a
         # plain rule should emit the canonical form.
-        rule = LayerRule(namespace="waybar", rule_name="blur")
+        rule = LayerRule(namespace="waybar", effects=[LayerEffect(name="blur")])
         assert rule.to_line().startswith(f"{config.KEYWORD_LAYERRULE} = ")
         assert config.KEYWORD_LAYERRULE == "layerrule"
 
@@ -372,28 +474,30 @@ class TestPresetCoverage:
 
 class TestSummaries:
     def test_summarize_namespace_regex(self):
-        rule = LayerRule(namespace="waybar", rule_name="blur")
+        rule = LayerRule(namespace="waybar", effects=[LayerEffect(name="blur")])
         assert summarize_namespace(rule) == "namespace: waybar"
 
     def test_summarize_action_bool_no_on_in_label(self):
         # Bool effects auto-``on`` on serialization but read cleaner
         # in the title without the redundant value.
-        rule = LayerRule(namespace="waybar", rule_name="blur", rule_args="on")
+        rule = LayerRule(namespace="waybar", effects=[LayerEffect(name="blur", args="on")])
         assert summarize_action(rule) == "Blur background"
 
     def test_summarize_action_with_args(self):
-        rule = LayerRule(namespace="waybar", rule_name="ignore_alpha", rule_args="0.30")
+        rule = LayerRule(
+            namespace="waybar", effects=[LayerEffect(name="ignore_alpha", args="0.30")]
+        )
         s = summarize_action(rule)
         assert "0.30" in s
 
     def test_summarize_action_custom(self):
-        rule = LayerRule(namespace="waybar", rule_name="plugin:foo", rule_args="bar")
+        rule = LayerRule(namespace="waybar", effects=[LayerEffect(name="plugin:foo", args="bar")])
         s = summarize_action(rule)
         assert "plugin:foo" in s
         assert "bar" in s
 
     def test_summarize_rule_returns_pair(self):
-        rule = LayerRule(namespace="waybar", rule_name="blur", rule_args="on")
+        rule = LayerRule(namespace="waybar", effects=[LayerEffect(name="blur", args="on")])
         title, subtitle = summarize_rule(rule)
         assert title == "Blur background"
         assert subtitle == "namespace: waybar"
@@ -425,7 +529,10 @@ class TestDropTargetIdx:
 
 class TestDetectReorder:
     def _items(self, *rule_names: str) -> list[LayerRule]:
-        return [LayerRule(namespace="waybar", rule_name=n, rule_args="on") for n in rule_names]
+        return [
+            LayerRule(namespace="waybar", effects=[LayerEffect(name=n, args="on")])
+            for n in rule_names
+        ]
 
     def test_no_change(self):
         items = self._items("blur", "no_anim")
@@ -460,14 +567,14 @@ class TestDetectReorder:
 class TestIterItemChanges:
     def test_added(self):
         saved: list[LayerRule] = []
-        current = [LayerRule(namespace="waybar", rule_name="blur", rule_args="on")]
+        current = [LayerRule(namespace="waybar", effects=[LayerEffect(name="blur", args="on")])]
         baselines: list[LayerRule | None] = [None]
         out = list(iter_item_changes(saved, current, baselines))
         assert out == [("added", 0, current[0], None)]
 
     def test_modified(self):
-        saved = [LayerRule(namespace="waybar", rule_name="blur", rule_args="on")]
-        current = [LayerRule(namespace="waybar", rule_name="blur", rule_args="off")]
+        saved = [LayerRule(namespace="waybar", effects=[LayerEffect(name="blur", args="on")])]
+        current = [LayerRule(namespace="waybar", effects=[LayerEffect(name="blur", args="off")])]
         # Annotation widens the element type so pyright doesn't flag the
         # invariant-list mismatch when passing into ``iter_item_changes``.
         baselines: list[LayerRule | None] = [saved[0]]
@@ -477,7 +584,7 @@ class TestIterItemChanges:
         assert out[0][1] == 0
 
     def test_removed(self):
-        saved = [LayerRule(namespace="waybar", rule_name="blur", rule_args="on")]
+        saved = [LayerRule(namespace="waybar", effects=[LayerEffect(name="blur", args="on")])]
         current: list[LayerRule] = []
         baselines: list[LayerRule | None] = []
         out = list(iter_item_changes(saved, current, baselines))
@@ -487,7 +594,7 @@ class TestIterItemChanges:
 
     def test_length_mismatch_raises(self):
         with pytest.raises(ValueError):
-            list(iter_item_changes([], [LayerRule("waybar", "blur", "on")], []))
+            list(iter_item_changes([], [LayerRule("waybar", [LayerEffect("blur", "on")])], []))
 
 
 # ---------------------------------------------------------------------------
@@ -501,27 +608,29 @@ class TestCountPendingChanges:
 
     def test_clean_list_zero(self):
         owned = SavedList(
-            [LayerRule(namespace="waybar", rule_name="blur", rule_args="on")],
+            [LayerRule(namespace="waybar", effects=[LayerEffect(name="blur", args="on")])],
             key=lambda r: r.to_line(),
         )
         assert count_pending_changes(owned.saved, list(owned), self._baselines(owned)) == 0
 
     def test_one_added_counts_one(self):
         owned: SavedList[LayerRule] = SavedList([], key=lambda r: r.to_line())
-        owned.append_new(LayerRule(namespace="waybar", rule_name="blur", rule_args="on"))
+        owned.append_new(
+            LayerRule(namespace="waybar", effects=[LayerEffect(name="blur", args="on")])
+        )
         assert count_pending_changes(owned.saved, list(owned), self._baselines(owned)) == 1
 
     def test_one_modified_counts_one(self):
         owned = SavedList(
-            [LayerRule(namespace="waybar", rule_name="blur", rule_args="on")],
+            [LayerRule(namespace="waybar", effects=[LayerEffect(name="blur", args="on")])],
             key=lambda r: r.to_line(),
         )
-        owned[0] = LayerRule(namespace="waybar", rule_name="blur", rule_args="off")
+        owned[0] = LayerRule(namespace="waybar", effects=[LayerEffect(name="blur", args="off")])
         assert count_pending_changes(owned.saved, list(owned), self._baselines(owned)) == 1
 
     def test_one_removed_counts_one(self):
         owned = SavedList(
-            [LayerRule(namespace="waybar", rule_name="blur", rule_args="on")],
+            [LayerRule(namespace="waybar", effects=[LayerEffect(name="blur", args="on")])],
             key=lambda r: r.to_line(),
         )
         owned.pop_at(0)
@@ -530,8 +639,8 @@ class TestCountPendingChanges:
     def test_reorder_counts_one_extra(self):
         owned = SavedList(
             [
-                LayerRule(namespace="waybar", rule_name="blur", rule_args="on"),
-                LayerRule(namespace="waybar", rule_name="no_anim", rule_args="on"),
+                LayerRule(namespace="waybar", effects=[LayerEffect(name="blur", args="on")]),
+                LayerRule(namespace="waybar", effects=[LayerEffect(name="no_anim", args="on")]),
             ],
             key=lambda r: r.to_line(),
         )
@@ -541,13 +650,15 @@ class TestCountPendingChanges:
     def test_added_plus_reorder(self):
         owned = SavedList(
             [
-                LayerRule(namespace="waybar", rule_name="blur", rule_args="on"),
-                LayerRule(namespace="waybar", rule_name="no_anim", rule_args="on"),
+                LayerRule(namespace="waybar", effects=[LayerEffect(name="blur", args="on")]),
+                LayerRule(namespace="waybar", effects=[LayerEffect(name="no_anim", args="on")]),
             ],
             key=lambda r: r.to_line(),
         )
         owned.move(0, 1)
-        owned.append_new(LayerRule(namespace="rofi", rule_name="dim_around", rule_args="on"))
+        owned.append_new(
+            LayerRule(namespace="rofi", effects=[LayerEffect(name="dim_around", args="on")])
+        )
         assert count_pending_changes(owned.saved, list(owned), self._baselines(owned)) == 2
 
 
@@ -564,7 +675,9 @@ class TestExternalLoader:
         managed.write_text("")
         external = load_external_layer_rules(root, managed)
         assert len(external) == 1
-        assert external[0].rule == LayerRule(namespace="waybar", rule_name="blur", rule_args="on")
+        assert external[0].rule == LayerRule(
+            namespace="waybar", effects=[LayerEffect(name="blur", args="on")]
+        )
         assert external[0].source_path == root
         assert external[0].lineno >= 1
 
@@ -611,16 +724,17 @@ class TestExternalLoader:
         assert len(external) == 1
         assert external[0].rule.rule_name == "blur"
 
-    def test_multi_effect_line_yields_multiple_external_entries(self, tmp_path):
-        # A single multi-effect line surfaces as N ExternalLayerRule
-        # entries so each effect gets its own row in the read-only display.
+    def test_multi_effect_line_surfaces_as_bundled_external_entry(self, tmp_path):
+        # A single multi-effect line surfaces as one ExternalLayerRule
+        # with all effects bundled — the read-only display preserves
+        # the user's authored shape (one line in, one row out).
         root = tmp_path / "hyprland.conf"
         managed = tmp_path / "hyprland-gui.conf"
         root.write_text("layerrule = match:namespace ^(waybar)$, blur on, ignore_alpha 0.3\n")
         managed.write_text("")
         external = load_external_layer_rules(root, managed)
-        assert len(external) == 2
-        assert {e.rule.rule_name for e in external} == {"blur", "ignore_alpha"}
+        assert len(external) == 1
+        assert {e.name for e in external[0].rule.effects} == {"blur", "ignore_alpha"}
 
 
 # ---------------------------------------------------------------------------

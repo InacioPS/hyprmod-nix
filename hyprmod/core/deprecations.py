@@ -227,6 +227,15 @@ def _scan_root(
             continue
         if new_text == original:
             continue
+        # ``migrate()`` also runs structural normalisations (windowrule
+        # block-form / single-line → :class:`Rule` node) that re-serialize
+        # to a canonical token order. That can change a file's text even
+        # when nothing in it is actually deprecated — show a plan only
+        # when the file carries at least one ``check_deprecated`` warning,
+        # so cosmetic reorders don't trigger the migration banner.
+        file_rules = rules_by_source.get(str(path), [])
+        if not file_rules:
+            continue
         fixable_paths.add(path)
         seen.add(_safe_resolve(path))
         plans.append(
@@ -236,7 +245,7 @@ def _scan_root(
                 is_symlink=root_was_symlink or path.is_symlink(),
                 original=original,
                 migrated=new_text,
-                rules=tuple(rules_by_source.get(str(path), [])),
+                rules=tuple(file_rules),
             )
         )
 

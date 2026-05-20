@@ -15,7 +15,7 @@ without dragging the parser or the IPC layer along.
 from dataclasses import dataclass
 from typing import Literal
 
-from hyprland_config import V3_BOOL_EFFECTS
+from hyprland_config import V3_BOOL_EFFECTS, Rule
 
 from hyprmod.constants import APPLICATION_ID
 from hyprmod.core import config
@@ -67,54 +67,148 @@ class Matcher:
 
 
 @dataclass(slots=True)
-class WindowRule:
-    """A v3 window rule: a list of matchers + a single effect.
+class Effect:
+    """A single ``EFFECT [ARGS]`` clause inside a windowrule.
 
-    The wiki technically allows multiple effects per rule
-    (``windowrule = match:class kitty, opacity 0.8, no_blur on``).
-    We model one effect per rule for UX simplicity — multi-effect
-    rules read by the parser get split into N rules sharing the same
-    matchers (and on save, two rules with identical matchers are
-    semantically equivalent to one rule with two effects).
+    Multi-effect block-form rules (``windowrule { match:class kitty;
+    border_size = 5; no_blur = on }``) become one :class:`WindowRule`
+    with several :class:`Effect` entries; single-line rules collapse
+    to a one-element list.
+    """
+
+    name: str
+    args: str = ""
+
+    @property
+    def full(self) -> str:
+        """Serialize as ``name [args]`` with auto-``on`` for v3 booleans.
+
+        Hyprland 0.53+ rejects bare boolean effects, so the empty-args
+        case fills in ``on`` for any name in :data:`V3_BOOL_EFFECTS`.
+        """
+        args = self.args.strip()
+        if not args and self.name in V3_BOOL_EFFECTS:
+            args = "on"
+        return f"{self.name} {args}" if args else self.name
+
+
+@dataclass(slots=True)
+class WindowRule:
+    """A v3 window rule: matchers plus one or more effects, optionally named.
+
+    Hyprland's special-category form (``windowrule { name = X;
+    match:K = V; e1 = …; e2 = … }``) bundles several effects under a
+    single name; single-line rules (``windowrule = match:K V, EFFECT
+    ARGS``) carry exactly one effect and no name. Both shapes land in
+    this dataclass — the serializer picks block vs. single-line at
+    :meth:`to_line` time based on whether *name*, *enabled*, or a
+    multi-effect list demand the block form (Hyprland rejects
+    ``name:``/``enable:`` tokens in the single-line handler).
     """
 
     matchers: list[Matcher]
-    # Full effect name (e.g. ``float``, ``opacity``, ``no_blur``).
-    effect_name: str
-    # Args after the effect name. Empty string for unary effects when
-    # building from scratch — the writer auto-fills ``on`` if the
-    # name is in :data:`V3_BOOL_EFFECTS`.
-    effect_args: str = ""
+    effects: list[Effect]
+    # Empty when the rule is anonymous. Naming a rule lets Hyprland's
+    # Lua API / ``hyprctl`` reference it for dynamic enable/disable.
+    name: str = ""
+    # False when the rule is defined-but-inactive (``enable = 0`` in
+    # the source block). Only meaningful for named rules; anonymous
+    # rules can't be toggled at runtime so the flag round-trips but
+    # has no UI affordance.
+    enabled: bool = True
+
+    # -- Single-effect compatibility shims ---------------------------------
+    # The dialog, runtime, and a chunk of the test suite predate the
+    # multi-effect refactor and reach for ``effect_name`` / ``effect_args``
+    # directly. These read the *first* effect and let single-effect
+    # callers keep working unchanged; multi-effect-aware sites should
+    # iterate :attr:`effects` instead.
+
+    @property
+    def effect_name(self) -> str:
+        return self.effects[0].name if self.effects else ""
+
+    @property
+    def effect_args(self) -> str:
+        return self.effects[0].args if self.effects else ""
 
     @property
     def effect_full(self) -> str:
-        """Return ``effect_name`` plus args, with auto-``on`` for booleans."""
-        args = self.effect_args.strip()
-        if not args and self.effect_name in V3_BOOL_EFFECTS:
-            # Hyprland 0.53+ rejects bare boolean effects; default to ``on``.
-            args = "on"
-        if args:
-            return f"{self.effect_name} {args}"
-        return self.effect_name
+        return self.effects[0].full if self.effects else ""
 
     def body(self) -> str:
-        """Serialize the value half of the rule line.
+        """Serialize the v3 single-line value half of the rule.
 
         Returns ``match:..., effect ...`` — i.e. everything that would
         come after ``windowrule = ``. Live-apply via ``hypr.keyword``
         wants exactly this; the keyword prefix is supplied separately.
+        Matchers come before effects by convention; Hyprland accepts
+        either order but match-first reads more naturally.
 
-        Matchers come before the effect by convention — Hyprland accepts
-        either order, but match-first reads more naturally as "for these
-        windows, do this."
+        :attr:`name` and the disabled flag are intentionally omitted
+        because Hyprland's single-line ``handleWindowrule`` rejects
+        them. Use :meth:`to_line` for the on-disk form that switches
+        to block when those fields demand it.
         """
         parts = [str(m) for m in self.matchers]
-        parts.append(self.effect_full)
+        parts.extend(e.full for e in self.effects)
         return ", ".join(parts)
 
+    def to_rule_node(self) -> Rule:
+        """Build the equivalent library :class:`hyprland_config.Rule` node.
+
+        Used for previews and writers that consume structured Rule
+        nodes — the language-specific serializers
+        (:func:`hyprland_config.render_rule_hyprlang`,
+        :func:`hyprland_config.render_rule_lua`) take a Rule and pick
+        the right shape (block / single-line / Lua table) themselves.
+        """
+        return Rule(
+            raw="",
+            kind=config.KEYWORD_WINDOWRULE,
+            name=self.name,
+            enabled=self.enabled,
+            matchers=[(m.key, m.value) for m in self.matchers if m.key != RAW_KEY],
+            effects=[(e.name, e.args) for e in self.effects],
+        )
+
     def to_line(self) -> str:
-        """Serialize as the full ``windowrule = match:..., effect ...`` line."""
+        """Serialize as the on-disk form: single-line keyword OR block.
+
+        Block form is used when the rule carries a :attr:`name` or is
+        disabled — those fields only exist in block syntax (Hyprland's
+        single-line handler rejects them). Anonymous enabled rules,
+        including multi-effect ones, emit as compact single-line —
+        Hyprland accepts multi-effect on one line and that matches
+        what users typically author.
+        """
+        needs_block = bool(self.name) or not self.enabled
+        if needs_block:
+            return self._to_block()
         return f"{config.KEYWORD_WINDOWRULE} = {self.body()}"
+
+    def _to_block(self) -> str:
+        """Serialize as a multi-line ``windowrule { … }`` block."""
+        lines = [f"{config.KEYWORD_WINDOWRULE} {{"]
+        if self.name:
+            lines.append(f"    name = {self.name}")
+        if not self.enabled:
+            lines.append("    enable = 0")
+        for m in self.matchers:
+            if m.key == RAW_KEY:
+                # No block-form equivalent for raw tokens — keep them as a
+                # comment so the user can fix them by hand rather than
+                # silently dropping content.
+                lines.append(f"    # raw: {m.value}")
+            else:
+                lines.append(f"    match:{m.key} = {m.value}")
+        for e in self.effects:
+            args = e.args.strip()
+            if not args and e.name in V3_BOOL_EFFECTS:
+                args = "on"
+            lines.append(f"    {e.name} = {args}" if args else f"    {e.name} =")
+        lines.append("}")
+        return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -583,13 +677,13 @@ def summarize_matchers(matchers: list[Matcher]) -> str:
     return f"{'not ' if negated else ''}{label}: {value}"
 
 
-def summarize_action(rule: WindowRule) -> str:
-    """Friendly label for a rule's effect (e.g. ``Set opacity: 0.8 0.95``)."""
-    preset = ACTION_PRESETS_BY_ID.get(rule.effect_name)
+def _summarize_one_effect(effect: Effect) -> str:
+    """Friendly label for a single effect (e.g. ``Set opacity: 0.8 0.95``)."""
+    preset = ACTION_PRESETS_BY_ID.get(effect.name)
     if preset is None:
-        full = rule.effect_full
+        full = effect.full
         return full or "(no action)"
-    args = rule.effect_args.strip()
+    args = effect.args.strip()
     # Boolean presets don't surface their auto-``on`` in the title —
     # "Float window" reads cleaner than "Float window: on".
     if not args or args.lower() == "on":
@@ -597,6 +691,30 @@ def summarize_action(rule: WindowRule) -> str:
     return f"{preset.label}: {args}"
 
 
+def summarize_action(rule: WindowRule) -> str:
+    """Friendly label for a rule's effects.
+
+    Single-effect rules read as ``Float window`` / ``Set opacity: 0.8``;
+    multi-effect (block / named) rules join the per-effect labels with
+    ``+`` to fit on one row, e.g. ``Float window + No blur``.
+    """
+    if not rule.effects:
+        return "(no action)"
+    if len(rule.effects) == 1:
+        return _summarize_one_effect(rule.effects[0])
+    return " + ".join(_summarize_one_effect(e) for e in rule.effects)
+
+
 def summarize_rule(rule: WindowRule) -> tuple[str, str]:
-    """Two-line ``(title, subtitle)`` summary for an ``Adw.ActionRow``."""
-    return summarize_action(rule), summarize_matchers(rule.matchers)
+    """Two-line ``(title, subtitle)`` summary for an ``Adw.ActionRow``.
+
+    The subtitle leads with the matchers so users key off "for these
+    windows…"; if the rule is named, the name is appended so block
+    rules are recognisable without expanding the row.
+    """
+    subtitle = summarize_matchers(rule.matchers)
+    if rule.name:
+        subtitle = f"{subtitle} · {rule.name}"
+    if not rule.enabled:
+        subtitle = f"{subtitle} (disabled)"
+    return summarize_action(rule), subtitle

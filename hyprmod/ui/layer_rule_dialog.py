@@ -29,7 +29,7 @@ so the dialog can always assume single-effect editing.
 from collections.abc import Callable
 
 from gi.repository import Adw, Gtk
-from hyprland_config import LAYER_BOOL_EFFECTS
+from hyprland_config import LAYER_BOOL_EFFECTS, render_rule_hyprlang, render_rule_lua
 
 from hyprmod.core import config
 from hyprmod.core.layer_rules import (
@@ -37,11 +37,26 @@ from hyprmod.core.layer_rules import (
     LAYER_ACTION_PRESETS,
     LayerActionField,
     LayerActionPreset,
+    LayerEffect,
     LayerRule,
     lookup_preset,
 )
-from hyprmod.ui import build_preview_group, format_config_preview
+from hyprmod.ui import build_preview_group
 from hyprmod.ui.dialog import SingletonDialogMixin
+
+
+def _preview_for(rule: LayerRule) -> str:
+    """Render *rule* in the active mode's syntax for the dialog preview.
+
+    Mirrors :func:`hyprmod.ui.window_rule_dialog._preview_for`: builds
+    the structured :class:`hyprland_config.Rule` node and feeds it to
+    the language-specific renderer so the preview is byte-faithful to
+    what would hit disk.
+    """
+    node = rule.to_rule_node()
+    if config.is_lua_mode():
+        return render_rule_lua(node)
+    return render_rule_hyprlang(node).rstrip("\n")
 
 
 class LayerRuleEditDialog(SingletonDialogMixin, Adw.Dialog):
@@ -76,6 +91,15 @@ class LayerRuleEditDialog(SingletonDialogMixin, Adw.Dialog):
         # Live preview label, refreshed on every form change.
         self._preview_label: Gtk.Label
 
+        # Pass-through state for the rule's optional name and enabled
+        # flag — set via the Name section UI; preserved unchanged when
+        # editing an anonymous rule.
+        self._rule_name: str = ""
+        self._rule_enabled: bool = True
+        # Trailing effects from a multi-effect block-form rule. See
+        # the windowrule dialog's identical comment.
+        self._extra_effects: list[LayerEffect] = []
+
         self.set_title("New Layer Rule" if self._is_new else "Edit Layer Rule")
         self.set_content_width(560)
         self.set_content_height(560)
@@ -108,6 +132,7 @@ class LayerRuleEditDialog(SingletonDialogMixin, Adw.Dialog):
         content.set_margin_start(18)
         content.set_margin_end(18)
 
+        content.append(self._build_name_section())
         content.append(self._build_match_section())
         content.append(self._build_apply_section())
         content.append(self._build_preview_section())
@@ -126,6 +151,35 @@ class LayerRuleEditDialog(SingletonDialogMixin, Adw.Dialog):
         self._refresh()
 
     # ── Section builders ──────────────────────────────────────────────
+
+    def _build_name_section(self) -> Gtk.Widget:
+        """Optional ``Name`` row plus disabled toggle for block-form rules.
+
+        Mirrors the windowrule dialog — naming a rule promotes it to
+        block form so Hyprland's Lua API / ``hyprctl`` can reference
+        it for dynamic enable/disable.
+        """
+        group = Adw.PreferencesGroup(title="Name (optional)")
+        group.set_description(
+            "Naming a rule lets you enable / disable it at runtime via "
+            "Hyprland's Lua API or hyprctl. Anonymous rules are written "
+            "as the compact one-line form."
+        )
+
+        self._name_entry = Adw.EntryRow(title="Name")
+        self._name_entry.set_text(self._rule_name)
+        self._name_entry.connect("changed", self._on_name_changed)
+        group.add(self._name_entry)
+
+        self._enabled_row = Adw.SwitchRow(
+            title="Enabled",
+            subtitle="Uncheck to keep the rule defined but inactive on next reload.",
+        )
+        self._enabled_row.set_active(self._rule_enabled)
+        self._enabled_row.connect("notify::active", self._on_enabled_changed)
+        group.add(self._enabled_row)
+
+        return group
 
     def _build_match_section(self) -> Gtk.Widget:
         """The 'Match this layer surface' group with the namespace entry."""
@@ -184,6 +238,17 @@ class LayerRuleEditDialog(SingletonDialogMixin, Adw.Dialog):
 
     def _load_from_rule(self, rule: LayerRule) -> None:
         """Populate widgets from an existing :class:`LayerRule` for editing."""
+        self._rule_name = rule.name
+        self._rule_enabled = rule.enabled
+        self._extra_effects = list(rule.effects[1:])
+        if hasattr(self, "_name_entry"):
+            self._name_entry.handler_block_by_func(self._on_name_changed)
+            self._name_entry.set_text(rule.name)
+            self._name_entry.handler_unblock_by_func(self._on_name_changed)
+        if hasattr(self, "_enabled_row"):
+            self._enabled_row.handler_block_by_func(self._on_enabled_changed)
+            self._enabled_row.set_active(rule.enabled)
+            self._enabled_row.handler_unblock_by_func(self._on_enabled_changed)
         self._namespace_entry.set_text(rule.namespace)
 
         # Effect: lookup_preset returns CUSTOM_PRESET for unknown leading
@@ -316,6 +381,14 @@ class LayerRuleEditDialog(SingletonDialogMixin, Adw.Dialog):
 
     # ── Refresh: preview + apply gating ───────────────────────────────
 
+    def _on_name_changed(self, *_args: object) -> None:
+        self._rule_name = self._name_entry.get_text().strip()
+        self._refresh()
+
+    def _on_enabled_changed(self, *_args: object) -> None:
+        self._rule_enabled = self._enabled_row.get_active()
+        self._refresh()
+
     def _on_field_changed(self, *_args: object) -> None:
         self._refresh()
 
@@ -324,9 +397,7 @@ class LayerRuleEditDialog(SingletonDialogMixin, Adw.Dialog):
         if rule is None:
             self._preview_label.set_text("(rule incomplete)")
         else:
-            self._preview_label.set_text(
-                format_config_preview(config.KEYWORD_LAYERRULE, rule.body())
-            )
+            self._preview_label.set_text(_preview_for(rule))
         # Apply gates on a non-empty namespace AND a non-empty rule name.
         ok = rule is not None and bool(rule.rule_name) and bool(rule.namespace.strip())
         self._apply_btn.set_sensitive(ok)
@@ -354,8 +425,9 @@ class LayerRuleEditDialog(SingletonDialogMixin, Adw.Dialog):
 
         return LayerRule(
             namespace=namespace,
-            rule_name=rule_name,
-            rule_args=rule_args,
+            effects=[LayerEffect(name=rule_name, args=rule_args), *self._extra_effects],
+            name=self._rule_name,
+            enabled=self._rule_enabled,
         )
 
     # ── Apply ─────────────────────────────────────────────────────────
