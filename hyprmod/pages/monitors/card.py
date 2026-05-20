@@ -18,8 +18,8 @@ from hyprmod.ui.signals import SignalBlocker
 BITDEPTHS = ["Auto", "8-bit", "10-bit"]
 BITDEPTH_VALUES = [None, "8", "10"]
 
-VRR_MODES = ["Off", "On", "Fullscreen only", "Fullscreen + Gaming"]
-VRR_VALUES = [None, "1", "2", "3"]
+VRR_MODES = ["Use global", "Off", "On", "Fullscreen only", "Fullscreen + Gaming"]
+VRR_VALUES = [None, "0", "1", "2", "3"]
 
 CM_MODES = ["Auto", "sRGB", "Adobe", "Wide", "EDID", "HDR", "HDR (EDID)"]
 CM_VALUES = [None, "srgb", "adobe", "wide", "edid", "hdr", "hdredid"]

@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Autostart page surfaces `exec` / `exec-once` entries defined in your `hyprland.conf` (or any file it sources) as read-only rows alongside the managed ones, matching the existing behavior of the Env Variables, Window Rules, and Layer Rules pages (#37)
 - Lua migration preserves Hyprlang `$var` references as named Lua locals instead of inlining their values or emitting literal `"$var"` strings that Hyprland rejected on reload (#38)
 - Deleting or disabling a window rule with `float`, `tile`, `pin`, `fullscreen`, or `maximize` now reverts the effect on matching open windows instead of waiting for the next Hyprland reload
+- Per-monitor VRR `Off` now writes `vrr, 0` and actually disables VRR; a new `Use global` option preserves the previous omit-the-clause behavior (#39)
 
 ## [0.2.0] - 2026-05-07
 
