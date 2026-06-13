@@ -116,6 +116,78 @@ class TestDescIdentifierResolution:
         assert page._monitors[0].identify_by_description is True
 
 
+class TestRefreshPreservesPendingEdits:
+    """Refreshing must not silently drop unsaved monitor edits or the dirty flag.
+
+    ``_on_refresh`` re-reads live IPC and re-applies the saved config (which
+    flattens extra fields and resets ownership). It used to then re-snapshot the
+    baseline, adopting the edited live state as "saved" and clearing dirty. Now
+    pending edits are captured and layered back on, and the baseline is kept.
+    """
+
+    def test_resolution_edit_survives_refresh(self, page_with_monitors):
+        page = page_with_monitors(
+            "monitor = DP-1, 1920x1080@60.00Hz, 0x0, 1\n",
+            # Second IPC read reflects the applied change, as a live apply would.
+            [
+                [_make_monitor("DP-1", "Acme Pixel 5000")],
+                [_make_monitor("DP-1", "Acme Pixel 5000")],
+            ],
+        )
+        assert page.is_dirty() is False
+
+        # Simulate an applied resolution change (what _apply_change leaves behind).
+        mon = page._monitors[0]
+        mon.width, mon.height, mon.mode = 2560, 1440, None
+        page._ownership.own("DP-1")
+        assert page.is_dirty() is True
+
+        page._on_refresh(None)
+
+        assert page.is_dirty() is True
+        assert (page._monitors[0].width, page._monitors[0].height) == (2560, 1440)
+
+    def test_extra_field_edit_survives_refresh(self, page_with_monitors):
+        # vrr is the tricky case: IPC reports it as a bool, so the reload can't
+        # recover the user's "2" — it must come from the captured pending edit.
+        page = page_with_monitors(
+            "monitor = DP-1, 1920x1080@60.00Hz, 0x0, 1\n",
+            [
+                [_make_monitor("DP-1", "Acme Pixel 5000")],
+                [_make_monitor("DP-1", "Acme Pixel 5000")],
+            ],
+        )
+        mon = page._monitors[0]
+        mon.vrr = "2"
+        page._ownership.own("DP-1")
+        assert page.is_dirty() is True
+
+        page._on_refresh(None)
+
+        assert page._monitors[0].vrr == "2"
+        assert page.is_dirty() is True
+
+    def test_added_monitor_survives_refresh(self, page_with_monitors):
+        # A monitor the user started managing (not in saved config) must stay
+        # owned and dirty across a refresh.
+        page = page_with_monitors(
+            "",
+            [
+                [_make_monitor("DP-1", "Acme Pixel 5000")],
+                [_make_monitor("DP-1", "Acme Pixel 5000")],
+            ],
+        )
+        mon = page._monitors[0]
+        mon.scale = 1.25
+        page._ownership.own("DP-1")
+        assert page.is_dirty() is True
+
+        page._on_refresh(None)
+
+        assert page._ownership.is_owned("DP-1") is True
+        assert page.is_dirty() is True
+
+
 class TestHdrExtras:
     def test_new_luminance_fields_round_trip(self, page_with_monitors):
         page = page_with_monitors(

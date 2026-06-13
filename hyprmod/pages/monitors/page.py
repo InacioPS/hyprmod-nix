@@ -58,8 +58,10 @@ class MonitorsPage(SectionPage):
         "width",
         "height",
         "refresh_rate",
+        "mode",
         "x",
         "y",
+        "position",
         "scale",
         "transform",
         "bit_depth",
@@ -134,14 +136,19 @@ class MonitorsPage(SectionPage):
             return
         self._push_undo(self._build_undo_entry(old, self._capture_undo()))
 
+    @classmethod
+    def _copy_editable_fields(cls, src: MonitorState, dst: MonitorState):
+        """Copy the config-line fields (geometry, extras, keywords) from src to dst."""
+        for field in cls._RESTORABLE_FIELDS:
+            setattr(dst, field, getattr(src, field))
+
     def restore_snapshot(self, monitor_copies, owned_names):
         """Restore monitors state from an undo/redo snapshot."""
         by_name = {m.name: m for m in monitor_copies}
         for mon in self._monitors:
             saved = by_name.get(mon.name)
             if saved:
-                for field in self._RESTORABLE_FIELDS:
-                    setattr(mon, field, getattr(saved, field))
+                self._copy_editable_fields(saved, mon)
         self._ownership.restore(owned_names)
         self._commit_to_hyprland()
 
@@ -506,8 +513,7 @@ class MonitorsPage(SectionPage):
             self._remove_monitor(mon)
             return
         with self._undo_track():
-            for field in self._RESTORABLE_FIELDS:
-                setattr(mon, field, getattr(baseline, field))
+            self._copy_editable_fields(baseline, mon)
             self._ownership.discard(mon.name)
             self._commit_to_hyprland()
 
@@ -641,13 +647,37 @@ class MonitorsPage(SectionPage):
     def _on_refresh(self, _button):
         self._resync_timer.cancel()
         old_names = [m.name for m in self._monitors]
+
+        # The reload re-reads live IPC and re-applies the saved config, which
+        # flattens unsaved extra-field edits (IPC reports vrr as a bool, etc.)
+        # and resets ownership to the disk set. Capture pending edits first so
+        # we can layer them back on afterward.
+        was_dirty = self.is_dirty()
+        pending = {
+            m.name: copy.deepcopy(m) for m in self._monitors if self._ownership.is_owned(m.name)
+        }
+        prev_owned = self._ownership.snapshot()
+
         self._reload_monitors()
-        # Re-snapshot so dirty tracking compares against the freshly-read disk state.
-        # Without this, a monitor that moved to a different port resolves to a new
-        # connector name in ownership, but the old snapshot still has the old name —
-        # leading to a phantom "pending changes" indicator.
-        self._save_snapshot()
-        self._save_confirmed_snapshot()
+
+        if was_dirty:
+            # Restore the user's unsaved edits and ownership. _reload_monitors
+            # leaves _saved_monitors untouched, so keeping (not re-snapshotting)
+            # the baseline is what preserves the dirty flag across a refresh.
+            by_name = {m.name: m for m in self._monitors}
+            for name, edited in pending.items():
+                mon = by_name.get(name)
+                if mon is not None:
+                    self._copy_editable_fields(edited, mon)
+            self._ownership.restore(prev_owned)
+        else:
+            # No pending edits — adopt the freshly-read state as the new
+            # baseline. This also clears any phantom dirty from a monitor that
+            # came back on a different connector (which renames its ownership
+            # key while the old snapshot still holds the old name).
+            self._save_snapshot()
+            self._save_confirmed_snapshot()
+
         # Push in place when the connector set is unchanged so any expanded
         # Advanced expander stays open; only rebuild when monitors actually
         # appeared, disappeared, or reordered.
