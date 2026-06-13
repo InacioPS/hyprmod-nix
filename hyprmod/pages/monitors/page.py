@@ -3,13 +3,14 @@
 import copy
 from collections.abc import Iterator
 
-from gi.repository import Adw, GLib, Gtk
+from gi.repository import Adw, Gtk
 from hyprland_monitors import get_monitor_capabilities
 from hyprland_monitors.monitors import (
     MonitorState,
     adjust_neighbors,
     all_monitors_connected,
     compute_valid_scales,
+    is_adjacent,
     lines_from_monitors,
     merge_saved_state,
     nearest_scale_index,
@@ -142,7 +143,6 @@ class MonitorsPage(SectionPage):
                 for field in self._RESTORABLE_FIELDS:
                     setattr(mon, field, getattr(saved, field))
         self._ownership.restore(owned_names)
-        self._push_to_ui()
         self._commit_to_hyprland()
 
     # -- Data loading --
@@ -166,6 +166,7 @@ class MonitorsPage(SectionPage):
         saved = config.collect_section(sections, config.KEYWORD_MONITOR)
         if saved:
             merge_saved_state(self._monitors, saved)
+
         self._ownership = OwnershipSet(self._managed_names_from_lines(saved))
         # Since monitor= is all-or-nothing, our line replaces the user's
         # entire line.  IPC may still report extras from the user's config
@@ -205,7 +206,14 @@ class MonitorsPage(SectionPage):
     def _snap_scales(self):
         """Map 2dp scales from Hyprland to full-precision 1/120 values."""
         for mon in self._monitors:
+            # Skip disabled or unconfigured monitors from IPC that have 0 width/height
+            if mon.disabled or mon.width == 0 or mon.height == 0:
+                continue
+
             vs = compute_valid_scales(mon.width, mon.height)
+            if not vs:
+                continue
+
             si = nearest_scale_index(vs, mon.scale)
             mon.scale = vs[si][0]
 
@@ -412,27 +420,56 @@ class MonitorsPage(SectionPage):
             self._applying = True
             try:
                 old_w, old_h = mon.effective_size
+
+                # Detect if the display is transitioning from disabled to enabled
+                is_being_enabled = mon.disabled and not new_vals.get("disabled", mon.disabled)
+
                 for k, v in new_vals.items():
                     setattr(mon, k, v)
-                if "width" in new_vals or "height" in new_vals:
-                    vs = compute_valid_scales(mon.width, mon.height)
-                    si = nearest_scale_index(vs, mon.scale)
-                    mon.scale = vs[si][0]
-                if "disabled" not in new_vals and "mirror_of" not in new_vals:
+                if is_being_enabled and mon.width == 0 and mon.height == 0:
+                    mon.mode = "preferred"
+
+                # Clear special keywords if explicit resolution/positioning changes are targeted
+                if not is_being_enabled:
+                    if "width" in new_vals or "height" in new_vals or "refresh_rate" in new_vals:
+                        mon.mode = None
+                    if "x" in new_vals or "y" in new_vals:
+                        mon.position = None
+
+                # Calculate side-effects (neighbor offsets / breaking mirror lines)
+                if (
+                    not is_being_enabled
+                    and "disabled" not in new_vals
+                    and "mirror_of" not in new_vals
+                ):
                     adjust_neighbors(self._monitors, mon, old_w, old_h)
+
                 # Disabling a monitor clears any monitors mirroring it
                 if new_vals.get("disabled"):
                     for other in self._monitors:
                         if other.mirror_of == mon.name:
                             other.mirror_of = None
                             self._ownership.own(other.name)
-                if not try_with_toast(
+
+                if is_being_enabled:
+                    has_active_neighbor = any(
+                        is_adjacent(mon, other)
+                        for other in self._monitors
+                        if other.name != mon.name and not other.disabled
+                    )
+                    if not has_active_neighbor:
+                        mon.position = "auto"
+
+                success = try_with_toast(
                     self._window.show_bug_toast,
                     "Monitor config failed",
                     lambda: self._window.hypr.monitors.apply(self._monitors),
                     catch=HyprlandError,
-                ):
+                )
+                if not success:
                     return
+
+                # Push safe UI state
                 self._push_to_ui()
             finally:
                 self._applying = False
@@ -443,17 +480,23 @@ class MonitorsPage(SectionPage):
         """Send all monitors to Hyprland, push to UI."""
         self._applying = True
         try:
-            self._window.hypr.monitors.apply(self._monitors)
-        except HyprlandError as e:
-            self._applying = False
-            self._window.show_bug_toast(f"Monitor config failed — {e}", detail=str(e), timeout=5)
-            return
-        try:
-            self._push_to_ui()
+            success = try_with_toast(
+                self._window.show_bug_toast,
+                "Monitor config failed",
+                lambda: self._window.hypr.monitors.apply(self._monitors),
+                catch=HyprlandError,
+            )
+
+            if success:
+                self._push_to_ui()
+
+                # Notify the state tracking system that updates occurred
+                # (e.g., triggers confirm banner)
+                self._on_monitors_changed()
+                self._schedule_resync()
+
         finally:
             self._applying = False
-        self._on_monitors_changed()
-        self._schedule_resync()
 
     def _discard_monitor(self, mon: MonitorState):
         """Revert a single monitor to its saved state."""
@@ -530,33 +573,39 @@ class MonitorsPage(SectionPage):
         self._resync_timer.schedule(200, self._deferred_resync)
 
     def _deferred_resync(self):
-        old_lines = lines_from_monitors(self._monitors)
+        old_managed = [m for m in self._monitors if self._ownership.is_owned(m.name)]
+        old_lines = sorted(lines_from_monitors(old_managed))
+
+        # Retrieve live dimensions directly from hardware with error handling
+
         actual = self._window.hypr.monitors.get_all()
-        if not actual:
-            return GLib.SOURCE_REMOVE
+        if actual:
+            actual_by_name = {m.name: m for m in actual if not m.disabled}
+            for mon in self._monitors:
+                hw_mon = actual_by_name.get(mon.name)
+                if not hw_mon:
+                    continue
 
-        actual_by_name = {m.name: m for m in actual}
-        for mon in self._monitors:
-            if mon.disabled:
-                continue
-            real = actual_by_name.get(mon.name)
-            if not real:
-                continue
-            # MonitorState and Monitor share the geometry fields used here;
-            # update_geometry_from_ipc declares Monitor but tolerates either.
-            mon.update_geometry_from_ipc(real)  # type: ignore[arg-type]
-            vs = compute_valid_scales(mon.width, mon.height)
-            si = nearest_scale_index(vs, real.scale)
-            mon.scale = vs[si][0]
+                # MonitorState and Monitor share the geometry fields used here;
+                # update_geometry_from_ipc declares Monitor but tolerates either.
+                mon.update_geometry_from_ipc(hw_mon)  # type: ignore[arg-type]
+                vs = compute_valid_scales(mon.width, mon.height)
+                if vs:
+                    si = nearest_scale_index(vs, hw_mon.scale)
+                    mon.scale = vs[si][0]
 
-        if lines_from_monitors(self._monitors) != old_lines:
-            self._applying = True
-            try:
-                self._push_to_ui()
-            finally:
-                self._applying = False
+        self._applying = True
+        try:
+            self._push_to_ui()
+        finally:
+            self._applying = False
+
+        # Only trigger change events if the geometry actually moved
+        new_managed = [m for m in self._monitors if self._ownership.is_owned(m.name)]
+        new_lines = sorted(lines_from_monitors(new_managed))
+
+        if new_lines != old_lines:
             self._on_monitors_changed()
-        return GLib.SOURCE_REMOVE
 
     # -- Preview drag --
 
@@ -575,9 +624,16 @@ class MonitorsPage(SectionPage):
     def _on_preview_drag_end(self):
         idx = self._last_dragged_idx
         self._last_dragged_idx = -1
+
         if 0 <= idx < len(self._monitors):
-            self._ownership.own(self._monitors[idx].name)
-        self._commit_to_hyprland()
+            mon = self._monitors[idx]
+            self._ownership.own(mon.name)
+
+            # Clear positional keywords (like "auto") so that
+            # Hyprland respects the explicit numeric x,y coordinates from the drag.
+            mon.position = None
+            self._commit_to_hyprland()
+
         if self._drag_undo_state is not None:
             self._push_undo_from(self._drag_undo_state)
             self._drag_undo_state = None
