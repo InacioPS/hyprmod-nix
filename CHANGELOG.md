@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Workspace rules in generated Lua configs now write the workspace selector as a string (`workspace = "1"` instead of `workspace = 1`); `hl.workspace_rule` declares the field as a string, and the integer form relied on Lua's implicit coercion and was flagged by lua-language-server (#48)
 - "Refresh monitors" no longer discards unsaved monitor changes and clears the pending-changes indicator
 - The workspace rule dialog's appearance overrides are now single "Use global / On / Off" dropdowns; the previous override-switch-plus-value-switch pair could keep showing "On" after the value was switched off
+- Binds using the `global` dispatcher (app-registered global shortcuts, e.g. `bind = SUPER, period, global, caelestia:emoji`) no longer fail to apply in Lua mode; the dispatcher had no Lua mapping (#49)
 
 ## [0.3.0] - 2026-05-25
 
