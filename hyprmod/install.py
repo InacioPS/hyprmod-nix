@@ -57,7 +57,11 @@ def _user_dest_map() -> list[tuple[Path, Path]]:
 
 def is_registered() -> bool:
     """Whether a .desktop entry for hyprmod is visible to the desktop."""
-    return Gio.DesktopAppInfo.new(DESKTOP_FILE) is not None
+    try:
+        return Gio.DesktopAppInfo.new(DESKTOP_FILE) is not None
+    except TypeError:
+        # PyGObject raises TypeError if the C constructor returns NULL
+        return False
 
 
 def install_user_files(*, quiet: bool = False) -> list[Path]:
