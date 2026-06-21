@@ -97,6 +97,11 @@ buildPythonApplication rec {
     hyprland-monitors
   ];
 
+  postInstall = ''
+    mkdir -p $out/share
+    cp -r data/* $out/share/
+  '';
+
   meta = {
     description = "Native GTK4/libadwaita settings app for Hyprland";
     homepage = "https://github.com/BlueManCZ/hyprmod";
