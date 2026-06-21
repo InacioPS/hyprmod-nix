@@ -86,6 +86,26 @@ curl -LsSf https://raw.githubusercontent.com/BlueManCZ/hyprmod/main/install.sh |
 yay -S hyprmod
 ```
 
+**NixOS** — via Flakes:
+
+Add the repository to your `flake.nix` inputs:
+```nix
+inputs.hyprmod.url = "github:InacioPS/hyprmod";
+```
+
+Then add it to your system or home-manager packages:
+```nix
+environment.systemPackages = [
+  inputs.hyprmod.packages.${pkgs.system}.default
+];
+```
+*(Remember to pass `inputs` via `specialArgs` to your NixOS configuration).*
+
+To run temporarily without installing:
+```bash
+nix run github:InacioPS/hyprmod
+```
+
 **Gentoo** — via the [`edgets`](https://github.com/BlueManCZ/edgets) overlay:
 
 ```bash
