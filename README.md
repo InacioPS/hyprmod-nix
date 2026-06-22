@@ -96,7 +96,7 @@ hyprmod.url = "github:InacioPS/hyprmod-nix";
 Then add it to your system or home-manager packages:
 ```nix
 environment.systemPackages = [
-  inputs.hyprmod.packages.${pkgs.system}.default
+  hyprmod.packages.${pkgs.system}.default
 ];
 ```
 *(Remember to pass `inputs` via `specialArgs` to your NixOS configuration).*
