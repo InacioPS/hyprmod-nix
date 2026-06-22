@@ -90,7 +90,7 @@ yay -S hyprmod
 
 Add the repository to your `flake.nix` inputs:
 ```nix
-hyprmod.url = "github:InacioPS/hyprmod";
+hyprmod.url = "github:InacioPS/hyprmod-nix";
 ```
 
 Then add it to your system or home-manager packages:
